@@ -1,5 +1,6 @@
 {
     "cline.vsCodeLmModelSelector": {
         
-    }
+    },
+    "python.languageServer": "None"
 }

@@ -46,6 +46,7 @@ class ProxyEndpoint:
         self.app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         self.app.router.add_post("/chat/completions", self.handle_chat_completions)
         self.app.router.add_post("/v1/embeddings", self.handle_embeddings)
+        self.app.router.add_post("/v1/rerank", self.handle_rerank)
         self.app.router.add_get("/health", self.handle_health_check)
         
     async def init_async_resources(self, app):
@@ -198,6 +199,11 @@ class ProxyEndpoint:
                     "base_url": config["base_url"],
                     "path": config["chat_completion_path"]
                 }
+            elif model in config.get("rerank_models", []):
+                return {
+                    "base_url": config["base_url"],
+                    "path": "/v1/rerank"
+                }
         
         logger.warning(f"⚠️ 未找到模型 {model} 的端点配置")
         return None
@@ -213,6 +219,7 @@ class ProxyEndpoint:
             '/v1/chat/completions',
             '/chat/completions',
             '/v1/embeddings',
+            '/v1/rerank',
             '/health'
         ]
         
@@ -229,6 +236,83 @@ class ProxyEndpoint:
             )
             return True
         return False
+
+    async def handle_rerank(self, request: web.Request) -> web.Response:
+        # 检查是否为可疑请求
+        if await self.is_suspicious_request(request):
+            await self.async_logger.warning(f"🚫 拒绝可疑请求访问 rerank 接口")
+            return web.Response(status=403, text=json.dumps({"error": "Forbidden"}))
+            
+        # 获取原始请求的headers和body
+        headers = dict(request.headers)
+        request_data = await request.json()
+        
+        # 获取模型对应的端点配置
+        model = request_data.get("model")
+        await self.async_logger.info(f"📝 处理rerank模型请求: {model}")
+        
+        # 查找支持rerank的端点
+        endpoint_config = self.get_endpoint_for_model(model)
+        
+        if not endpoint_config:
+            await self.async_logger.warning(f"❌ 不支持的rerank模型: {model}")
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": f"不支持的rerank模型: {model}"})
+            )
+        
+        # 创建新的headers，保持原始认证信息
+        forward_headers = {
+            "Content-Type": "application/json",
+            "Authorization": headers.get("Authorization", "")
+        }
+        
+        # 记录请求开始时间
+        start_time = time.time()
+        
+        async with aiohttp.ClientSession() as session:
+            target_url = f"{endpoint_config['base_url']}{endpoint_config['path']}"
+            try:
+                # 设置超时时间
+                timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_connect=30, sock_read=600)
+                async with session.post(
+                    target_url,
+                    headers=forward_headers,
+                    json=request_data,
+                    timeout=timeout
+                ) as resp:
+                    # 记录请求耗时
+                    elapsed_time = time.time() - start_time
+                    await self.async_logger.info(f"rerank请求耗时: {elapsed_time:.2f}秒")
+                    
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        await self.async_logger.error(f"❌ rerank目标服务器错误: {error_text}")
+                        return web.Response(
+                            status=resp.status,
+                            text=json.dumps({"error": f"rerank目标服务器错误: {error_text}"})
+                        )
+                    
+                    # 处理响应
+                    try:
+                        response_text = await resp.text()
+                        response_json = json.loads(response_text)
+                        await self.async_logger.info("✅ rerank响应处理完成")
+                        
+                        return web.Response(
+                            status=200,
+                            body=json.dumps(response_json, ensure_ascii=False).encode('utf-8'),
+                            content_type="application/json"
+                        )
+                    except aiohttp.ClientPayloadError as e:
+                        await self.async_logger.error(f"❌ 响应数据传输错误: {e}")
+                        return web.Response(status=500, text=json.dumps({"error": "响应数据传输错误，请重试"}))
+            except json.JSONDecodeError:
+                await self.async_logger.error("❌ 无效的rerank请求数据格式")
+                return web.Response(status=400, text=json.dumps({"error": "无效的请求数据格式"}))
+            except Exception as e:
+                await self.async_logger.error(f"处理rerank请求时发生错误: {e}\n{traceback.format_exc()}")
+                return web.Response(status=500, text=json.dumps({"error": "服务器内部错误"}))
 
     async def handle_health_check(self, request: web.Request) -> web.Response:
         # 检查是否为可疑请求

@@ -4,9 +4,11 @@
             "base_url": "https://api.siliconflow.cn",
             "chat_completion_path": "/v1/chat/completions",
             "embeddings_path": "/v1/embeddings",
+            "rerank_path": "/v1/rerank",
             "models": ["Qwen/Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-R1", 
-                       "Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-V3","BBAI/bge-m3"],
+                       "Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-V3","Qwen/QVQ-72B-Preview"],
             "embeddings_models": ["BAAI/bge-m3"],
+            "rerank_models": ["BAAI/bge-reranker-v2-m3"],
             "auth_type": "bearer"
         },
         "910b": {
@@ -43,6 +45,7 @@
             "base_url": "http://group.sx.10086.cn/aigw",
             "chat_completion_path": "/v1/chat/completions",
             "embeddings_path": "/v1/embeddings",
+            "rerank_path": "/v1/rerank",
             "embeddings_models": ["ROOT-bge-m3"],
             "models": ["deepseek-r1"],
             "auth_type": "bearer"
