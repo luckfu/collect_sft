@@ -6,15 +6,9 @@
             "embeddings_path": "/v1/embeddings",
             "rerank_path": "/v1/rerank",
             "models": ["Qwen/Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-R1", 
-                       "Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-V3","Qwen/QVQ-72B-Preview"],
+                       "Qwen2.5-7B-Instruct","Pro/deepseek-ai/DeepSeek-V3","Qwen/QVQ-72B-Preview","Pro/moonshotai/Kimi-K2-Instruct"],
             "embeddings_models": ["BAAI/bge-m3"],
             "rerank_models": ["BAAI/bge-reranker-v2-m3"],
-            "auth_type": "bearer"
-        },
-        "910b": {
-            "base_url": "http://36.141.21.137:9081",
-            "chat_completion_path": "/v1/chat/completions",
-            "models": ["DeepSeek-R1"],
             "auth_type": "bearer"
         },
         "deepseek": {
@@ -41,16 +35,18 @@
             "models": ["qwq-32b"],
             "auth_type": "bearer"
         },
-        "山西": {
-            "base_url": "http://group.sx.10086.cn/aigw",
+        "月之暗面": {
+            "base_url": "https://api.moonshot.cn",
             "chat_completion_path": "/v1/chat/completions",
-            "embeddings_path": "/v1/embeddings",
-            "rerank_path": "/v1/rerank",
-            "embeddings_models": ["ROOT-bge-m3"],
-            "models": ["deepseek-r1"],
+            "models": ["kimi-k2-0711-preview"],
+            "auth_type": "bearer"
+        },
+        "moonshot": {
+            "base_url": "https://api.moonshot.cn/anthropic",
+            "anthropic_path": "/v1/messages",
+            "models": ["claude-opus-4-20250514","claude-3-5-haiku-20241022","claude-sonnet-4-20250514"],
             "auth_type": "bearer"
         }
-        
     }
 }
 

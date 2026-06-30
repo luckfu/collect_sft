@@ -38,8 +38,7 @@ class ProxyEndpoint:
         self.port = port
         self.setup_routes()
         self.load_config()
-        
-        # 在应用启动时添加异步初始化函数
+        self.async_logger: Optional[logging.Logger] = None  # 添加类型提示，确保不为 None
         self.app.on_startup.append(self.init_async_resources)
     
     def setup_routes(self):
@@ -48,15 +47,16 @@ class ProxyEndpoint:
         self.app.router.add_post("/v1/embeddings", self.handle_embeddings)
         self.app.router.add_post("/v1/rerank", self.handle_rerank)
         self.app.router.add_get("/health", self.handle_health_check)
+        self.app.router.add_post("/anthropic/v1/messages", self.handle_anthropic_messages)
         
     async def init_async_resources(self, app):
         """初始化异步资源（日志和数据库）"""
         # 初始化异步日志
         await asyncio.to_thread(init_async_logger, "proxy_endpoint", "proxy_endpoint.log", getattr(logging, args.log_level.upper()))
         self.async_logger = get_async_logger()
+        if self.async_logger is None:
+            raise ValueError("Failed to initialize async_logger")
         await self.async_logger.info("✅ 异步日志初始化完成")
-        
-        # 初始化数据库路径
         await init_db_path("interactions.db")
         await self.async_logger.info("✅ 数据库初始化完成")
         
@@ -126,7 +126,7 @@ class ProxyEndpoint:
         forward_headers = {
             "Content-Type": "application/json",
             "Authorization": headers.get("Authorization", ""),
-            "Content-Length": headers.get("Content-Length", "")
+            "x-api-key": headers.get("x-api-key", "")
         }
         
         # 记录请求开始时间
@@ -208,6 +208,22 @@ class ProxyEndpoint:
         logger.warning(f"⚠️ 未找到模型 {model} 的端点配置")
         return None
 
+    def get_endpoint_for_anthropic_model(self, model: str) -> Optional[Dict[str, Any]]:
+        """根据模型名称获取对应的 Anthropic 端点配置"""
+        if not self.config or "endpoints" not in self.config:
+            logger.error("❌ 配置文件中缺少endpoints配置")
+            return None
+        
+        for provider, config in self.config["endpoints"].items():
+            if model in config.get("models", []) and "anthropic_path" in config:
+                return {
+                    "base_url": config["base_url"],
+                    "anthropic_path": config["anthropic_path"]
+                }
+        
+        logger.warning(f"⚠️ 未找到 Anthropic 模型 {model} 的端点配置")
+        return None
+
     # 添加异常访问检测和日志记录
     async def is_suspicious_request(self, request: web.Request) -> bool:
         """检查是否为可疑请求"""
@@ -220,7 +236,8 @@ class ProxyEndpoint:
             '/chat/completions',
             '/v1/embeddings',
             '/v1/rerank',
-            '/health'
+            '/health',
+            '/anthropic/v1/messages'
         ]
         
         # 检查请求路径是否在合法路径列表中
@@ -321,282 +338,216 @@ class ProxyEndpoint:
         return web.Response(status=200, text=json.dumps({"status": "ok"}))
 
     async def handle_chat_completions(self, request: web.Request) -> web.StreamResponse:
-        # 检查是否为可疑请求
         if await self.is_suspicious_request(request):
             await self.async_logger.warning(f"🚫 拒绝可疑请求访问 chat/completions 接口")
             return web.Response(status=403, text=json.dumps({"error": "Forbidden"}))
-            
-        # 获取原始请求的headers和body
         headers = dict(request.headers)
         request_data = await request.json()
-        
-        # 检查请求体大小
         messages = request_data.get("messages", [])
         total_chars = sum(len(str(msg)) for msg in messages)
-            
-        # 设置最大请求大小限制（约8MB）
         max_chars = 8000000
         if total_chars > max_chars:
             await self.async_logger.warning(f"❌ 请求体过大: {total_chars} 字符，超过限制 {max_chars} 字符")
-            return web.Response(
-                status=413,
-                text=json.dumps({"error": "请求体过大，请减小输入数据大小或分批处理"})
-            )
-            
-        # 记录原始请求信息
+            return web.Response(status=413, text=json.dumps({"error": "请求体过大，请减小输入数据大小或分批处理"}))
         await self.async_logger.debug("📝 收到新的请求")
-        # 创建请求头的副本并移除敏感信息
         safe_headers = headers.copy()
         if "Authorization" in safe_headers:
             safe_headers["Authorization"] = "[REDACTED]"
-        #await self.async_logger.debug(f"请求头: {json.dumps(safe_headers, ensure_ascii=False, indent=2)}")
+        if "x-api-key" in safe_headers:
+            safe_headers["x-api-key"] = "[REDACTED]"
         await self.async_logger.debug(f"请求体: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
-        
-        # 获取模型对应的端点配置
         model = request_data.get("model")
         await self.async_logger.info(f"📝 处理模型请求: {model}")
         endpoint_config = self.get_endpoint_for_model(model)
-        
         if not endpoint_config:
             await self.async_logger.warning(f"❌ 不支持的模型: {model}")
-            return web.Response(
-                status=400,
-                text=json.dumps({"error": f"不支持的模型: {model}"})
-            )
-        
-        # 创建新的headers，保持原始认证信息
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": headers.get("Authorization", "")
-        }
-        
-        # 判断是否为流式请求
+            return web.Response(status=400, text=json.dumps({"error": f"不支持的模型: {model}"}))
+        forward_headers = {"Content-Type": "application/json", "Authorization": headers.get("Authorization", "")}
         is_stream = request_data.get("stream", False)
         await self.async_logger.info(f"📡 转发请求到目标服务器: {endpoint_config['base_url']}, 流式请求: {is_stream}")
-        
-        # 记录请求开始时间
         start_time = time.time()
-        
         async with aiohttp.ClientSession() as session:
             target_url = f"{endpoint_config['base_url']}{endpoint_config['path']}"
             try:
-                # 设置更长的超时时间，包括连接和读取超时
                 timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_connect=30, sock_read=600)
-                async with session.post(
-                    target_url,
-                    headers=forward_headers,
-                    json=request_data,
-                    timeout=timeout
-                ) as resp:
-                    # 记录请求耗时
+                async with session.post(target_url, headers=forward_headers, json=request_data, timeout=timeout) as resp:
                     elapsed_time = time.time() - start_time
                     await self.async_logger.info(f"请求耗时: {elapsed_time:.2f}秒")
-                    
                     if resp.status != 200:
                         error_text = await resp.text()
                         await self.async_logger.error(f"❌ 目标服务器错误: {error_text}")
-                        return web.Response(
-                            status=resp.status,
-                            text=json.dumps({"error": f"目标服务器错误: {error_text}"})
-                        )
-                    
+                        return web.Response(status=resp.status, text=json.dumps({"error": f"目标服务器错误: {error_text}"}))
                     await self.async_logger.info("✅ 成功接收到目标服务器响应")
-                    
-                    # 判断是否为API调用
                     is_api_call = request.path.startswith('/v1/') or request.path.startswith('/chat/')
-                    
                     if is_stream:
-                        # 处理流式响应
-                        response = web.StreamResponse(
-                            status=200,
-                            headers={
-                                "Content-Type": "text/event-stream",
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive"
-                            }
-                        )
+                        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
                         await response.prepare(request)
                         await self.async_logger.info("🌊 开始处理流式响应")
-                        
                         complete_response = ""
                         complete_reasoning = ""
                         has_reasoning = False
                         response_id = None
                         saved_to_db = False
-                        
                         try:
                             async for line in resp.content:
-                                try:
-                                    # 检查客户端连接状态
-                                    if request.transport is None or request.transport.is_closing():
-                                        await self.async_logger.warning("客户端连接已关闭，终止响应")
-                                        # 设置标记以跳过数据库写入
-                                        saved_to_db = True
+                                line_str = line.decode("utf-8")
+                                await response.write(line)
+                                if line_str.startswith("data: "):
+                                    if line_str.strip() == "data: [DONE]":
+                                        if is_api_call and response_id and not saved_to_db:
+                                            final_response = complete_response
+                                            if has_reasoning and complete_reasoning:
+                                                final_response = f"<think>\n{complete_reasoning}\n</think>\n\n\n{complete_response}"
+                                            formatted_conversation = format_to_sharegpt(model, request_data, final_response)
+                                            async with aiosqlite.connect("interactions.db") as conn:
+                                                await conn.execute("INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)", (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False)))
+                                                await conn.commit()
+                                                saved_to_db = True
                                         break
-                                    
-                                    line_str = line.decode("utf-8")
-                                    #await self.async_logger.debug(f"接收到流式数据: ～{line_str}～")
-                                    
-                                    # 写入响应前记录日志
-                                    await response.write(line)
-                                    
-                                    if line_str.startswith("data: "):
-                                        # 先检查是否为结束标记
-                                        if line_str.strip() == "data: [DONE]":
-                                            await self.async_logger.info("收到流式响应结束标记")
-                                            # 只有在正常完成时才保存数据
-                                            if is_api_call and response_id and not saved_to_db:
-                                                try:
-                                                    # 构建最终响应
-                                                    final_response = complete_response
-                                                    if has_reasoning and complete_reasoning:
-                                                        final_response = f"<think>\n{complete_reasoning}\n</think>\n\n\n{complete_response}"
-                                                    await self.async_logger.debug(f"规整后的流式返回内容: ～{final_response}～")
-                                                    formatted_conversation = format_to_sharegpt(model, request_data, final_response)
-                                                    async with aiosqlite.connect("interactions.db") as conn:
-                                                        await conn.execute(
-                                                            "INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)",
-                                                            (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False))
-                                                        )
-                                                        await conn.commit()
-                                                        saved_to_db = True
-                                                        await self.async_logger.info("✅ 流式响应数据已存入数据库")
-                                                except sqlite3.IntegrityError:
-                                                    await self.async_logger.warning(f"⚠️ ID {response_id} 已存在，跳过保存")
-                                                except Exception as e:
-                                                    await self.async_logger.error(f"❌ 保存流式响应数据时出错: {e}")
-                                            break
-                                        
-                                        try:
-                                            json_chunk = json.loads(line_str[6:])
-                                            if "id" in json_chunk and not response_id:
-                                                response_id = json_chunk["id"]
-                                                await self.async_logger.debug(f"获取到响应ID: {response_id}")
-                                            
-                                            if "choices" in json_chunk and json_chunk["choices"]:
-                                                delta = json_chunk["choices"][0].get("delta", {})
-                                                #await self.async_logger.debug(f"处理delta数据: {json.dumps(delta, ensure_ascii=False)}")
-                                                
-                                                reasoning = delta.get("reasoning_content")
-                                                if reasoning is not None:
-                                                    complete_reasoning += reasoning
-                                                    has_reasoning = True
-                                                    #await self.async_logger.debug(f"添加reasoning内容: {reasoning}")
-                                                
-                                                content = delta.get("content")
-                                                if content is not None:
-                                                    complete_response += content
-                                                    #await self.async_logger.debug(f"添加content内容: {content}")
-                                        except json.JSONDecodeError as e:
-                                            if line_str.strip() != "data: [DONE]":
-                                                await self.async_logger.error(f"JSON解析错误: {e}, 原始数据: {line_str}\n{traceback.format_exc()}")
-                                        except Exception as e:
-                                            await self.async_logger.error(f"处理JSON数据时发生错误: {e}, 原始数据: {line_str}\n{traceback.format_exc()}")
-                                except Exception as e:
-                                    await self.async_logger.error(f"处理单行数据时发生错误: {e}\n{traceback.format_exc()}")
-                                    continue
-                                
-                        except asyncio.TimeoutError as e:
-                            await self.async_logger.error(f"❌ 流式响应处理超时: {e}\n{traceback.format_exc()}")
+                                json_chunk = json.loads(line_str[6:])
+                                if "id" in json_chunk and not response_id:
+                                    response_id = json_chunk["id"]
+                                if "choices" in json_chunk and json_chunk["choices"]:
+                                    delta = json_chunk["choices"][0].get("delta", {})
+                                    reasoning = delta.get("reasoning_content")
+                                    if reasoning is not None:
+                                        complete_reasoning += reasoning
+                                        has_reasoning = True
+                                    content = delta.get("content")
+                                    if content is not None:
+                                        complete_response += content
                         except Exception as e:
-                            await self.async_logger.error(f"流式响应处理过程中发生错误: {e}\n{traceback.format_exc()}")
+                            await self.async_logger.error(f"流式响应处理过程中发生错误: {e}")
                         finally:
-                            # 只在正常结束时保存数据，异常情况下跳过
                             if response_id and not saved_to_db and complete_response:
-                                try:
-                                    final_response = complete_response
-                                    if has_reasoning and complete_reasoning:
-                                        final_response = f"<think>\n{complete_reasoning}\n</think>\n\n\n{complete_response}"
-                                    
-                                    formatted_conversation = format_to_sharegpt(
-                                        model,
-                                        request_data,
-                                        final_response
-                                    )
-                                    
-                                    # 使用简单的异步数据库连接
-                                    conn = None
-                                    try:
-                                        # 直接创建新的数据库连接
-                                        conn = await get_db_connection()
-                                        await save_conversation_async(
-                                            conn,
-                                            response_id,
-                                            model,
-                                            formatted_conversation
-                                        )
-                                        saved_to_db = True
-                                        await self.async_logger.info("✅ 流式响应数据已存入数据库")
-                                    except sqlite3.IntegrityError:
-                                        await self.async_logger.warning(f"⚠️ ID {response_id} 已存在，跳过保存")
-                                        saved_to_db = True
-                                    except Exception as e:
-                                        await self.async_logger.error(f"❌ 保存流式响应数据时出错: {e}\n{traceback.format_exc()}")
-                                    finally:
-                                        if conn:
-                                            await conn.close()
-                                except Exception as e:
-                                    await self.async_logger.error(f"❌ 保存流式响应数据时出错: {e}\n{traceback.format_exc()}")
-                            
-                            # 确保返回响应对象
-                            return response
+                                final_response = complete_response if not has_reasoning else f"<think>\n{complete_reasoning}\n</think>\n\n\n{complete_response}"
+                                formatted_conversation = format_to_sharegpt(model, request_data, final_response)
+                                conn = await get_db_connection()
+                                await save_conversation_async(conn, response_id, model, formatted_conversation)
+                                await conn.close()
+                                saved_to_db = True
+                        return response
                     else:
-                        # 处理非流式响应
                         response_json = await resp.json()
                         await self.async_logger.info("✅ 非流式响应处理完成")
-                        await self.async_logger.debug(f"响应内容: {json.dumps(response_json, ensure_ascii=False, indent=2)}")
-                        
-                        # 解析响应并保存数据
                         response_id = response_json.get("id")
                         if response_id and "choices" in response_json and response_json["choices"]:
                             choice = response_json["choices"][0]
-                            response_content = ""
-                            reasoning_content = ""
-                            
-                            if "message" in choice:
-                                reasoning = choice["message"].get("reasoning_content")
-                                if reasoning is not None:
-                                    reasoning_content = reasoning
-                                content = choice["message"].get("content")
-                                if content is not None:
-                                    response_content = content
-                            
-                            # 格式化最终响应
-                            final_response = response_content
-                            if reasoning_content:
-                                final_response = f"<think>\n{reasoning_content}\n</think>\n\n\n{response_content}"
-                            
-                            # 保存到数据库
-                            try:
-                                formatted_conversation = format_to_sharegpt(
-                                    model,
-                                    request_data,
-                                    final_response
-                                )
-                                
-                                async with aiosqlite.connect("interactions.db") as conn:
-                                    await conn.execute(
-                                        "INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)",
-                                        (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False))
-                                    )
-                                    await conn.commit()
-                                    await self.async_logger.info("✅ 非流式响应数据已存入数据库")
-                            except sqlite3.IntegrityError:
-                                await self.async_logger.warning(f"⚠️ ID {response_id} 已存在，跳过保存")
-                            except Exception as e:
-                                await self.async_logger.error(f"❌ 保存非流式响应数据时出错: {e}")
-                        
-                        # 返回响应
-                        return web.Response(
-                            status=200,
-                            body=json.dumps(response_json, ensure_ascii=False).encode('utf-8'),
-                            content_type="application/json"
-                        )
-            except json.JSONDecodeError:
-                await self.async_logger.error(f"❌ 无效的请求数据格式\n{traceback.format_exc()}")
-                return web.Response(status=400, text=json.dumps({"error": "无效的请求数据格式"}))
+                            reasoning_content = choice["message"].get("reasoning_content", "")
+                            response_content = choice["message"].get("content", "")
+                            final_response = f"<think>\n{reasoning_content}\n</think>\n\n\n{response_content}" if reasoning_content else response_content
+                            formatted_conversation = format_to_sharegpt(model, request_data, final_response)
+                            async with aiosqlite.connect("interactions.db") as conn:
+                                await conn.execute("INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)", (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False)))
+                                await conn.commit()
+                        return web.Response(status=200, body=json.dumps(response_json, ensure_ascii=False).encode('utf-8'), content_type="application/json")
             except Exception as e:
-                await self.async_logger.error(f"处理请求时发生错误: {e}\n{traceback.format_exc()}")
+                await self.async_logger.error(f"处理请求时发生错误: {e}")
+                return web.Response(status=500, text=json.dumps({"error": "服务器内部错误"}))
+    async def handle_anthropic_messages(self, request: web.Request) -> web.StreamResponse:
+        if await self.is_suspicious_request(request):
+            await self.async_logger.warning(f"🚫 拒绝可疑请求访问 anthropic/messages 接口")
+            return web.Response(status=403, text=json.dumps({"error": "Forbidden"}))
+        headers = dict(request.headers)
+        request_data = await request.json()
+        messages = request_data.get("messages", [])
+        total_chars = sum(len(str(msg)) for msg in messages)
+        max_chars = 8000000
+        if total_chars > max_chars:
+            await self.async_logger.warning(f"❌ 请求体过大: {total_chars} 字符，超过限制 {max_chars} 字符")
+            return web.Response(status=413, text=json.dumps({"error": "请求体过大，请减小输入数据大小或分批处理"}))
+        safe_headers = headers.copy()
+        if "Authorization" in safe_headers:
+            safe_headers["Authorization"] = "[REDACTED]"
+        if "x-api-key" in safe_headers:
+            safe_headers["x-api-key"] = "[REDACTED]"
+        await self.async_logger.debug("📝 收到新的 Anthropic 请求")
+        await self.async_logger.debug(f"请求头: {json.dumps(safe_headers, ensure_ascii=False, indent=2)}")
+        await self.async_logger.debug(f"请求体: {json.dumps(request_data, ensure_ascii=False, indent=2)}")
+        model = request_data.get("model")
+        await self.async_logger.info(f"📝 处理 Anthropic 模型请求: {model}")
+        endpoint_config = self.get_endpoint_for_anthropic_model(model)
+        if not endpoint_config:
+            await self.async_logger.warning(f"❌ 不支持的 Anthropic 模型: {model}")
+            return web.Response(status=400, text=json.dumps({"error": f"不支持的模型: {model}"}))
+        
+        auth_header = headers.get("Authorization", "")
+        api_key = ""
+        if auth_header.startswith("Bearer "):
+            api_key = auth_header.replace("Bearer ", "").strip()
+        elif headers.get("x-api-key"):
+            api_key = headers.get("x-api-key")
+
+        forward_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        is_stream = request_data.get("stream", False)
+        await self.async_logger.info(f"📡 转发 Anthropic 请求到: {endpoint_config['base_url']}, 流式: {is_stream}")
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            target_url = f"{endpoint_config['base_url']}{endpoint_config['anthropic_path']}"
+            try:
+                timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_connect=30, sock_read=600)
+                async with session.post(target_url, headers=forward_headers, json=request_data, timeout=timeout) as resp:
+                    elapsed_time = time.time() - start_time
+                    await self.async_logger.info(f"Anthropic 请求耗时: {elapsed_time:.2f}秒")
+                    response_text = await resp.text()
+                    await self.async_logger.info(f"目标服务器响应头: {resp.headers}")
+                    await self.async_logger.info(f"目标服务器响应体: {response_text}")
+                    if resp.status != 200:
+                        await self.async_logger.error(f"❌ Anthropic 目标服务器错误: {response_text}")
+                        return web.Response(status=resp.status, text=json.dumps({"error": f"目标服务器错误: {response_text}"}))
+                    await self.async_logger.info("✅ 成功接收到 Anthropic 服务器响应")
+                    if is_stream:
+                        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
+                        await response.prepare(request)
+                        await self.async_logger.info("🌊 开始处理 Anthropic 流式响应")
+                        complete_response = ""
+                        response_id = None
+                        saved_to_db = False
+                        try:
+                            async for line in resp.content:
+                                line_str = line.decode("utf-8")
+                                await response.write(line)
+                                if line_str.startswith("data: "):
+                                    if line_str.strip() == "data: [DONE]":
+                                        if response_id and not saved_to_db:
+                                            formatted_conversation = format_to_sharegpt(model, request_data, complete_response)
+                                            async with aiosqlite.connect("interactions.db") as conn:
+                                                await conn.execute("INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)", (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False)))
+                                                await conn.commit()
+                                                saved_to_db = True
+                                        break
+                                    json_chunk = json.loads(line_str[6:])
+                                    if "id" in json_chunk and not response_id:
+                                        response_id = json_chunk["id"]
+                                    if "delta" in json_chunk:
+                                        content = json_chunk.get("delta", {}).get("text", "")
+                                        complete_response += content
+                        except Exception as e:
+                            await self.async_logger.error(f"Anthropic 流式响应处理错误: {e}")
+                        finally:
+                            if response_id and not saved_to_db and complete_response:
+                                formatted_conversation = format_to_sharegpt(model, request_data, complete_response)
+                                conn = await get_db_connection()
+                                await save_conversation_async(conn, response_id, model, formatted_conversation)
+                                await conn.close()
+                        return response
+                    else:
+                        response_json = await resp.json()
+                        await self.async_logger.info("✅ Anthropic 非流式响应处理完成")
+                        response_id = response_json.get("id")
+                        if response_id:
+                            response_content = response_json.get("content", [{}])[0].get("text", "")
+                            formatted_conversation = format_to_sharegpt(model, request_data, response_content)
+                            async with aiosqlite.connect("interactions.db") as conn:
+                                await conn.execute("INSERT INTO interactions (id, model, conversation) VALUES (?, ?, ?)", (response_id, model, json.dumps(formatted_conversation, ensure_ascii=False)))
+                                await conn.commit()
+                        return web.Response(status=200, body=json.dumps(response_json, ensure_ascii=False).encode('utf-8'), content_type="application/json")
+            except Exception as e:
+                await self.async_logger.error(f"处理 Anthropic 请求时发生错误: {e}")
                 return web.Response(status=500, text=json.dumps({"error": "服务器内部错误"}))
 
 
@@ -606,6 +557,6 @@ if __name__ == "__main__":
     try:
         web.run_app(proxy.app, host="0.0.0.0", port=args.port)
     except Exception as e:
-        logger.error(f"启动服务器时发生错误: {e}")
+        logger.error(f"启动服务器时发生致命错误: {e}", exc_info=True)
     finally:
         logger.info("服务器已关闭")

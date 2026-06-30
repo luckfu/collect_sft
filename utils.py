@@ -135,128 +135,66 @@ async def get_db_connection() -> aiosqlite.Connection:
         logger.error(f"创建数据库连接时出错: {e}\n{traceback.format_exc()}")
         raise
 
-def format_to_sharegpt(model: str, messages: dict, response: str) -> dict:
+def format_to_sharegpt(model: str, messages: list, response: str) -> dict:
     """将对话格式化为目标格式"""
-     # 获取异步日志器实例
-    async_logger = get_async_logger()
-    if async_logger:
-        asyncio.create_task(async_logger.debug(f"format_to_sharegpt 消息: {messages}"))
-        asyncio.create_task(async_logger.debug(f"format_to_sharegpt 响应内容: {response}"))
-    # 从 messages 字典中提取实际的对话消息列表
-    actual_messages = messages.get('messages', [])
+    system_message = ""
     conversations = []
     
-    # 遍历对话消息
-    for msg in actual_messages:
-        if not isinstance(msg, dict):
-            continue  # 跳过非字典消息
-        
-        role = msg.get("role")
-        if role == "user":
-            content = msg.get("content", "")
-            if content:
-                # Ensure content is a string before stripping
-                if not isinstance(content, str):
-                    content_str = json.dumps(content, ensure_ascii=False)
-                else:
-                    content_str = content
-                
-                conversations.append({
-                    "from": "human",
-                    "value": content_str.strip()
-                })
-        elif role == "assistant":
-            # 先处理 assistant 的文本内容（如果有）
-            content = msg.get("content")
-            if content:
-                 # Ensure content is a string before stripping
-                if not isinstance(content, str):
-                    content_str = json.dumps(content, ensure_ascii=False)
-                else:
-                    content_str = content
-                conversations.append({
-                    "from": "gpt",
-                    "value": content_str.strip()
-                })
-            # 再处理 tool_calls（如果有）
-            if "tool_calls" in msg:
+    # 处理原始消息
+    for msg in messages:
+        if msg["role"] == "system":
+            system_message = msg["content"] if isinstance(msg["content"], str) else str(msg["content"])
+        else:
+            # 将 user 转换为 human，assistant 转换为 gpt
+            role = "human" if msg["role"] == "user" else "gpt"
+            content = msg["content"]
+            if isinstance(content, list):
+                content = "\n".join(str(item) for item in content)
+            elif not isinstance(content, str):
+                content = str(content)
+            conversations.append({
+                "from": role,
+                "value": content.strip()
+            })
+            
+            # 如果消息中包含工具调用，添加相应的 function_call 和 observation
+            if msg.get("tool_calls"):
                 for tool_call in msg["tool_calls"]:
-                    # 提取 function details
-                    function_details = tool_call.get("function", {})
-                    function_name = function_details.get("name", "")
-                    function_args = function_details.get("arguments", "{}") # Default to empty JSON string
-                    
-                    # Ensure arguments are valid JSON string before parsing
-                    try:
-                        # Attempt to parse arguments to ensure they are valid JSON
-                        json.loads(function_args)
-                    except json.JSONDecodeError:
-                        # If arguments are not valid JSON, represent them as a string
-                        function_args_str = str(function_args)
-                        # Log a warning or handle as appropriate
-                        # For now, we'll just use the string representation
-                        pass # Keep function_args as is if already string
-                    except TypeError:
-                         # Handle cases where arguments might not be string-like (e.g., None)
-                        function_args = json.dumps(function_args) # Convert to JSON string
-
+                    # 添加函数调用
                     conversations.append({
                         "from": "function_call",
-                        "value": json.dumps({
-                            "id": tool_call.get("id", ""), # Include tool_call_id
-                            "function": {
-                                "name": function_name,
-                                "arguments": function_args
-                            },
-                            "type": tool_call.get("type", "function") # Include type if available
-                        }, ensure_ascii=False)
+                        "value": json.dumps(tool_call, ensure_ascii=False)
                     })
-        elif role == "tool":
-            content = msg.get("content", "")
-            if content:
-                # Check if content is a list, convert to string if necessary
-                if isinstance(content, list):
-                    content_str = json.dumps(content, ensure_ascii=False)
-                else:
-                    # Ensure content is treated as a string
-                    content_str = str(content)
-                # Ensure content is a string before stripping
-                if not isinstance(content_str, str):
-                    # If it became a list/dict dump again, just use the string representation
-                    content_str = str(content)
-                    
+                    # 如果有工具调用结果，添加 observation
+                    if "function" in tool_call and "output" in tool_call:
+                        conversations.append({
+                            "from": "observation",
+                            "value": tool_call["output"]
+                        })
+    
+    # 处理助手的回复
+    conversations.append({
+        "from": "gpt",
+        "value": response.strip()
+    })
+    
+    # 如果最后的响应包含工具调用，也需要添加
+    try:
+        response_data = json.loads(response)
+        if isinstance(response_data, dict) and response_data.get("tool_calls"):
+            for tool_call in response_data["tool_calls"]:
                 conversations.append({
-                    "from": "observation",
-                    # Include tool_call_id if available in the original message
-                    "tool_call_id": msg.get("tool_call_id", ""), 
-                    "value": content_str.strip()
+                    "from": "function_call",
+                    "value": json.dumps(tool_call, ensure_ascii=False)
                 })
+    except json.JSONDecodeError:
+        pass
     
-    # 添加助手回复（如果有）
-    if response:
-        conversations.append({
-            "from": "gpt",
-            "value": response.strip()
-        })
-
-    # 从messages中提取system消息
-    system_message = ""
-    for msg in actual_messages:
-        if isinstance(msg, dict) and msg.get("role") == "system":
-            system_message = msg.get("content", "")
-            break
-    
-    result = {
+    return {
         "conversations": conversations,
-        "system": system_message
+        "system": system_message,
+        "tools": []  # 可以根据实际工具定义填充此字段
     }
-    
-    # 只有当 messages 中包含 tools 字段时才添加到返回值中
-    if 'tools' in messages:
-        result['tools'] = messages['tools']
-    
-    return result
-
 
 def save_conversation(conn, response_id: str, model: str, conversation: dict):
     """保存对话数据到数据库（同步版本）"""
