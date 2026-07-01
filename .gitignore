@@ -3,6 +3,7 @@
 *.pyc
 __pycache__/
 .env
+.DS_Store
 data/
 *.bak
 .waylog/
