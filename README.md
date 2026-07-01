@@ -167,7 +167,7 @@ Anthropic's `thinking` block (with `signature`), `tool_use` block, `tool_result`
 ## Project Structure
 
 ```
-collect_sft/
+llm-tap/
 ├── proxy_oneapi.py    # Transparent proxy server
 ├── raw_storage.py     # Faithful call storage
 ├── stream_merger.py   # Stream response merging (OpenAI Chat / Anthropic Messages)

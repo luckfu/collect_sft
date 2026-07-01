@@ -167,7 +167,7 @@ Anthropic 协议的 `thinking` block（含 `signature`）、`tool_use` block、`
 ## 项目结构
 
 ```
-collect_sft/
+llm-tap/
 ├── proxy_oneapi.py    # 透明代理服务器
 ├── raw_storage.py     # 原始调用保真存储
 ├── stream_merger.py   # 流式响应整合（OpenAI Chat / Anthropic Messages）
