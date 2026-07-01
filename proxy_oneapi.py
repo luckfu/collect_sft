@@ -111,6 +111,7 @@ class ProxyServer:
         self.app = web.Application()
         self.port = port
         self.log_level = log_level
+        self.runner: Optional[web.AppRunner] = None
         self.app.on_startup.append(self.init_async_resources)
 
     async def init_async_resources(self, app):
@@ -123,15 +124,22 @@ class ProxyServer:
         await self.async_logger.info("Database initialized")
 
     async def start(self):
-        runner = web.AppRunner(self.app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.port)
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "0.0.0.0", self.port)
         await site.start()
         await self.async_logger.info(f"Transparent proxy started on port {self.port}")
         await self.async_logger.info(
             f"   Usage: change client URL from https://api.xxx.com/v1/... "
             f"to http://127.0.0.1:{self.port}/api.xxx.com/v1/..."
         )
+
+    async def stop(self):
+        """Cleanly stop the AppRunner so the listening socket is released."""
+        if self.runner is not None:
+            await self.runner.cleanup()
+            self.runner = None
+            await self.async_logger.info(f"Transparent proxy stopped on port {self.port}")
 
     # ========== 核心路由：catch-all 透明转发 ==========
 
@@ -817,30 +825,83 @@ async def main():
     return server
 
 
+class ProxyHandle:
+    """Handle to a proxy running in a background thread.
+
+    Supports clean shutdown so the listening socket on the old port is released
+    before a new proxy is started on a different port.
+    """
+
+    def __init__(self, thread, loop, server: "ProxyServer"):
+        self.thread = thread
+        self.loop = loop
+        self.server = server
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Schedule runner cleanup on the proxy loop, then stop the loop and join."""
+        if not self.thread or not self.thread.is_alive():
+            return
+        loop = self.loop
+        server = self.server
+
+        async def _shutdown():
+            try:
+                if server is not None:
+                    await server.stop()
+            except Exception as e:
+                logger.error(f"Error during proxy shutdown: {e}")
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+            fut.result(timeout=timeout)
+        except Exception as e:
+            logger.error(f"Proxy shutdown coroutine failed: {e}")
+
+        # break out of run_forever() so the thread can exit and close the loop
+        loop.call_soon_threadsafe(loop.stop)
+        self.thread.join(timeout=timeout)
+
+
 def start_proxy_in_thread(port: int = 8000, config: str = "config.json",
-                         log_level: str = "INFO", on_started=None):
+                         log_level: str = "INFO", on_started=None) -> "ProxyHandle":
     """Start the proxy in a background daemon thread (for embedding in tray apps).
 
-    Returns the started threading.Thread instance.
+    Returns a ProxyHandle whose stop() releases the listening socket and joins
+    the worker thread, so the proxy can be cleanly restarted on a new port.
     """
     import threading
 
+    # Create the loop in the caller thread; run it in the worker thread.
+    # run_coroutine_threadsafe() can then schedule the shutdown coroutine on it.
+    loop = asyncio.new_event_loop()
+    state = {"server": None, "ready": threading.Event()}
+
     def _run():
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         server = ProxyServer(config, port, log_level=log_level)
         _register_routes(server)
+        state["server"] = server
         try:
             loop.run_until_complete(server.start())
+            state["ready"].set()
             if on_started:
                 on_started()
             loop.run_forever()
         except Exception as e:
             logger.error(f"Proxy thread error: {e}")
+            state["ready"].set()  # unblock waiter even on failure
+        finally:
+            try:
+                if not loop.is_closed():
+                    loop.close()
+            except Exception:
+                pass
 
     t = threading.Thread(target=_run, name="proxy-loop", daemon=True)
     t.start()
-    return t
+    # block until the server is listening (or fails to start)
+    state["ready"].wait(timeout=10.0)
+    return ProxyHandle(t, loop, state["server"])
 
 
 if __name__ == "__main__":

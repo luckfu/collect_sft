@@ -6,3 +6,5 @@ __pycache__/
 data/
 *.bak
 .waylog/
+.vscode/
+.claude/

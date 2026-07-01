@@ -17,7 +17,7 @@ import json
 import threading
 import webbrowser
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import pystray
 
 import proxy_oneapi
@@ -28,6 +28,26 @@ DEFAULT_PORT = 12345
 DATA_DIR = os.path.expanduser("~/.llm-tap")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 ACTIVE_DURATION = 2.0  # seconds the icon stays "active" after a captured call
+
+# LANCZOS moved between Pillow versions; resolve once at import time.
+_RESAMPLE = getattr(Image, "LANCZOS", None) or Image.Resampling.LANCZOS
+
+
+def _load_font(size: int):
+    """Load a bold TTF for the count badge, falling back to PIL's default."""
+    for p in (
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def _load_settings() -> dict:
@@ -50,7 +70,7 @@ class TrayApp:
         self.count = 0
         self.active_until = 0.0
         self.lock = threading.Lock()
-        self.proxy_thread = None
+        self.proxy_handle = None
         self.icon = pystray.Icon(
             "llm-tap",
             self._draw_icon(active=False),
@@ -71,24 +91,97 @@ class TrayApp:
     # ---------- icon rendering (PIL, runtime) ----------
 
     def _draw_icon(self, active: bool, count: int = 0) -> Image.Image:
+        """A polished teardrop ("tap") icon with a vertical gradient.
+
+        Idle   = calm blue-teal droplet.
+        Active = green droplet with a soft glow halo + a red count badge.
+        Drawn at 4x and downsampled with LANCZOS for anti-aliased edges.
+        """
+        SS = 4  # supersample factor
         size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        # base circle: green when active, gray when idle
-        color = (46, 204, 113, 255) if active else (150, 150, 150, 255)
-        d.ellipse((6, 6, size - 6, size - 6), fill=color)
-        # letter "T" in the center
-        try:
-            d.text((26, 18), "T", fill=(255, 255, 255, 255))
-        except Exception:
-            pass
-        # count badge only while active
+        S = size * SS
+
+        if active:
+            top, bot = (170, 245, 190), (20, 170, 95)
+            glow_color = (46, 204, 113, 150)
+        else:
+            top, bot = (160, 225, 240), (30, 125, 170)
+            glow_color = None
+
+        # droplet geometry (in supersampled space)
+        cx = S // 2
+        bulb_r = int(S * 0.30)
+        bulb_cy = int(S * 0.60)
+        apex_y = int(S * 0.10)
+
+        # droplet mask = bulb circle + tapered top.
+        # The triangle base sits inside the bulb so the circle smooths the shoulders.
+        mask = Image.new("L", (S, S), 0)
+        md = ImageDraw.Draw(mask)
+        md.ellipse((cx - bulb_r, bulb_cy - bulb_r, cx + bulb_r, bulb_cy + bulb_r), fill=255)
+        base_y = bulb_cy - int(bulb_r * 0.42)
+        chord = int(bulb_r * 0.91)  # half-width of the bulb at base_y
+        md.polygon([(cx - chord, base_y), (cx + chord, base_y), (cx, apex_y)], fill=255)
+
+        # vertical gradient clipped to the droplet mask
+        grad = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grad)
+        for y in range(S):
+            t = y / (S - 1)
+            r = int(top[0] * (1 - t) + bot[0] * t)
+            g = int(top[1] * (1 - t) + bot[1] * t)
+            b = int(top[2] * (1 - t) + bot[2] * t)
+            gd.line([(0, y), (S - 1, y)], fill=(r, g, b, 255))
+        grad.putalpha(mask)
+
+        scene = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+
+        # soft glow halo behind the droplet (active only)
+        if glow_color is not None:
+            glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            gld = ImageDraw.Draw(glow)
+            gr = int(bulb_r * 1.35)
+            gld.ellipse((cx - gr, bulb_cy - gr, cx + gr, bulb_cy + gr), fill=glow_color)
+            glow = glow.filter(ImageFilter.GaussianBlur(7 * SS))
+            scene = Image.alpha_composite(scene, glow)
+        scene = Image.alpha_composite(scene, grad)
+
+        # specular highlight on the upper-left of the bulb
+        hl = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        hd = ImageDraw.Draw(hl)
+        hd.ellipse(
+            (cx - int(bulb_r * 0.55), bulb_cy - int(bulb_r * 0.62),
+             cx - int(bulb_r * 0.08), bulb_cy - int(bulb_r * 0.18)),
+            fill=(255, 255, 255, 75),
+        )
+        scene = Image.alpha_composite(scene, hl)
+
+        # downsample for crisp anti-aliased edges
+        img = scene.resize((size, size), _RESAMPLE)
+
         if active and count > 0:
-            bx, by, br = size - 14, 14, 12
-            d.ellipse((bx - br, by - br, bx + br, by + br), fill=(231, 76, 60, 255))
-            label = str(count) if count < 10 else "9+"
-            d.text((bx - 4, by - 8), label, fill=(255, 255, 255, 255))
+            self._draw_badge(img, count)
         return img
+
+    def _draw_badge(self, img: Image.Image, count: int) -> None:
+        """Red count badge in the top-right corner."""
+        d = ImageDraw.Draw(img)
+        size = img.width
+        cx, cy = size - 13, 13
+        r = 11
+        d.ellipse((cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1), fill=(255, 255, 255, 235))
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(231, 76, 60, 255))
+        label = str(count) if count < 10 else "9+"
+        font = _load_font(14)
+        try:
+            bbox = font.getbbox(label)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            tx = cx - w / 2 - bbox[0]
+            ty = cy - h / 2 - bbox[1]
+        except Exception:
+            tx, ty = cx - 3, cy - 7
+        d.text((tx, ty), label, font=font, fill=(255, 255, 255, 255))
 
     def _refresh_icon(self) -> None:
         active = time.time() < self.active_until
@@ -102,11 +195,13 @@ class TrayApp:
             self.active_until = time.time() + ACTIVE_DURATION
         # pystray icon update is thread-safe; runs on main thread
         self._refresh_icon()
+        # revert to idle after the active window
+        threading.Timer(ACTIVE_DURATION + 0.05, self._refresh_icon).start()
 
     # ---------- proxy lifecycle ----------
 
     def _start_proxy(self) -> None:
-        self.proxy_thread = proxy_oneapi.start_proxy_in_thread(
+        self.proxy_handle = proxy_oneapi.start_proxy_in_thread(
             port=self.port,
             config=os.path.join(DATA_DIR, "config.json"),
             log_level="INFO",
@@ -115,10 +210,15 @@ class TrayApp:
     def _restart_proxy(self, new_port: int) -> None:
         """Restart the proxy thread with a new port.
 
-        The old aiohttp AppRunner is inside a daemon thread's event loop which we
-        can't cleanly stop from here; we simply abandon it and start a new thread
-        bound to the new port. The old loop/thread exit when the app quits.
+        Stops the old proxy's AppRunner so its listening socket is released,
+        then starts a fresh proxy bound to the new port.
         """
+        if self.proxy_handle is not None:
+            try:
+                self.proxy_handle.stop()
+            except Exception as e:
+                print(f"[llm-tap] failed to stop old proxy: {e}")
+            self.proxy_handle = None
         self.port = new_port
         self._start_proxy()
 

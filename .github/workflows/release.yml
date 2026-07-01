@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          pyinstaller --windowed --noconfirm \
+          pyinstaller --windowed --onefile --noconfirm \
             --name llm-tap \
             --hidden-import ${{ matrix.pystray_backend }} \
             tray_app.py
