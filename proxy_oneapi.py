@@ -106,15 +106,16 @@ def verify_auth(request: web.Request, config: dict) -> bool:
 # ========== 代理服务器 ==========
 
 class ProxyServer:
-    def __init__(self, config_path: str, port: int = 8000):
+    def __init__(self, config_path: str, port: int = 8000, log_level: str = "INFO"):
         self.config = load_config(config_path)
         self.app = web.Application()
         self.port = port
+        self.log_level = log_level
         self.app.on_startup.append(self.init_async_resources)
 
     async def init_async_resources(self, app):
         await asyncio.to_thread(init_async_logger, "proxy", "proxy.log",
-                                getattr(logging, args.log_level.upper()))
+                                getattr(logging, self.log_level.upper()))
         self.async_logger = get_async_logger()
         await self.async_logger.info("Async logger initialized")
         await init_db_path("calls.db")
