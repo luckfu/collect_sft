@@ -10,24 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-13
-            name: llm-tap-macos-x86_64
-            backend: pyobjc
-            pystray_backend: pystray._darwin
-          - os: macos-14
-            name: llm-tap-macos-arm64
-            backend: pyobjc
-            pystray_backend: pystray._darwin
-          - os: windows-latest
-            name: llm-tap-windows-x86_64
-            backend: pywin32
-            pystray_backend: pystray._win32
-    runs-on: ${{ matrix.os }}
+  build-macos:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -39,41 +23,58 @@ jobs:
         shell: bash
         run: |
           pip install --upgrade pip
-          pip install aiohttp aiosqlite pillow pystray ${{ matrix.backend }} pyinstaller
+          pip install aiohttp aiosqlite pillow pystray pyobjc pyinstaller
 
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
+      - name: Build universal2 .app
         shell: bash
         run: |
+          # Build a universal2 app (arm64 + x86_64) on an Apple Silicon runner.
+          # Produces a single llm-tap.app that runs natively on both Intel
+          # and Apple Silicon Macs, without needing the scarce macos-13 runner.
           pyinstaller --windowed --noconfirm \
             --name llm-tap \
             --osx-bundle-identifier com.llmtap.app \
-            --hidden-import ${{ matrix.pystray_backend }} \
+            --target-architecture universal2 \
+            --hidden-import pystray._darwin \
             tray_app.py
 
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
+      - name: Package
+        shell: bash
+        run: |
+          cd dist && tar -czf ../llm-tap-macos-universal2.tar.gz llm-tap.app
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: llm-tap-macos-universal2.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install aiohttp aiosqlite pillow pystray pywin32 pyinstaller
+
+      - name: Build .exe
         shell: bash
         run: |
           pyinstaller --windowed --onefile --noconfirm \
             --name llm-tap \
-            --hidden-import ${{ matrix.pystray_backend }} \
+            --hidden-import pystray._win32 \
             tray_app.py
 
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          cd dist && tar -czf ../${{ matrix.name }}.tar.gz llm-tap.app
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/llm-tap.exe -DestinationPath ${{ matrix.name }}.zip
+          Compress-Archive -Path dist/llm-tap.exe -DestinationPath llm-tap-windows-x86_64.zip
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ matrix.name }}.tar.gz
-            ${{ matrix.name }}.zip
+          files: llm-tap-windows-x86_64.zip
