@@ -190,7 +190,7 @@ python3 proxy_oneapi.py -p 12345 --log-level INFO
 
 ## Desktop App (Menu Bar / System Tray)
 
-A tray wrapper is available via `tray_app.py`. It starts the proxy in the background and shows an icon in the macOS menu bar / Windows system tray that turns **green with a count badge** for ~2s whenever a call is captured.
+A tray wrapper is available via `tray_app.py`. It starts the proxy in the background and shows a teardrop icon in the macOS menu bar / Windows system tray — blue-teal when idle, **green with a soft glow and a red count badge** for ~2s whenever a call is captured. The tray menu lets you open the Web UI, change the listen port (persisted to `~/.llm-tap/settings.json`), and quit.
 
 ```bash
 pip install -r requirements-app.txt
@@ -199,11 +199,11 @@ pip install pyobjc
 # Windows backend:
 pip install pywin32
 
-python3 tray_app.py                 # default port 8000
-LLM_TAP_PORT=12345 python3 tray_app.py
+python3 tray_app.py                 # default port 12345
+LLM_TAP_PORT=9000 python3 tray_app.py
 ```
 
-Data is stored under `~/.llm-tap/` when running as a desktop app. Tray menu: open Web UI, view captured count, quit.
+Data is stored under `~/.llm-tap/` when running as a desktop app.
 
 ### Prebuilt Releases
 
@@ -216,6 +216,14 @@ Prebuilt binaries are published via GitHub Actions on every `v*` tag:
 | `llm-tap-windows-x86_64.zip` | Windows x64 |
 
 Download from the [Releases page](https://github.com/luckfu/llm-tap/releases).
+
+**macOS**: the downloaded `.app` is unsigned, so Gatekeeper will block it on first launch. Unblock with:
+
+```bash
+xattr -cr /path/to/llm-tap.app
+```
+
+**Windows**: SmartMark may warn about an unsigned `.exe`; choose "More info → Run anyway".
 
 ## Design Principles
 

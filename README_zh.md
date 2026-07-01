@@ -190,7 +190,7 @@ python3 proxy_oneapi.py -p 12345 --log-level INFO
 
 ## 桌面应用（菜单栏 / 系统托盘）
 
-通过 `tray_app.py` 提供托盘包装：在后台启动代理，并在 macOS 顶部菜单栏 / Windows 系统托盘显示图标，**每采集到一次调用就变绿并显示计数徽标约 2 秒**。
+通过 `tray_app.py` 提供托盘包装：在后台启动代理，并在 macOS 顶部菜单栏 / Windows 系统托盘显示水滴图标——空闲时为蓝青色，**每采集到一次调用就变绿并泛起柔光、右上角显示红色计数徽标约 2 秒**。托盘菜单可打开 Web 界面、修改监听端口（持久化到 `~/.llm-tap/settings.json`）、退出。
 
 ```bash
 pip install -r requirements-app.txt
@@ -199,11 +199,11 @@ pip install pyobjc
 # Windows 后端：
 pip install pywin32
 
-python3 tray_app.py                 # 默认端口 8000
-LLM_TAP_PORT=12345 python3 tray_app.py
+python3 tray_app.py                 # 默认端口 12345
+LLM_TAP_PORT=9000 python3 tray_app.py
 ```
 
-作为桌面应用运行时，数据存放在 `~/.llm-tap/`。托盘菜单：打开 Web 界面、查看采集数量、退出。
+作为桌面应用运行时，数据存放在 `~/.llm-tap/`。
 
 ### 预构建发布版
 
@@ -216,6 +216,14 @@ LLM_TAP_PORT=12345 python3 tray_app.py
 | `llm-tap-windows-x86_64.zip` | Windows x64 |
 
 可在 [Releases 页面](https://github.com/luckfu/llm-tap/releases) 下载。
+
+**macOS**：下载的 `.app` 未签名，首次打开会被 Gatekeeper 拦截，执行以下命令解除隔离：
+
+```bash
+xattr -cr /path/to/llm-tap.app
+```
+
+**Windows**：未签名的 `.exe` 可能触发 SmartScreen 警告，选择"更多信息 → 仍要运行"即可。
 
 ## 设计原则
 
