@@ -11,15 +11,10 @@ permissions:
 
 jobs:
   build-macos:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-13
-            name: llm-tap-macos-x86_64
-          - os: macos-14
-            name: llm-tap-macos-arm64
-    runs-on: ${{ matrix.os }}
+    # arm64 build on Apple Silicon runner (fast, ~1min queue).
+    # x86_64 build is produced locally on an Intel Mac and uploaded
+    # separately, to avoid the long macos-13 (Intel) runner queue.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -36,9 +31,6 @@ jobs:
       - name: Build .app
         shell: bash
         run: |
-          # Native build for the runner's architecture.
-          # macos-13 (Intel) -> x86_64, macos-14 (Apple Silicon) -> arm64.
-          # Each produces a native .app; no cross-arch wheel merging needed.
           pyinstaller --windowed --noconfirm \
             --name llm-tap \
             --osx-bundle-identifier com.llmtap.app \
@@ -48,11 +40,11 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          cd dist && tar -czf ../${{ matrix.name }}.tar.gz llm-tap.app
+          cd dist && tar -czf ../llm-tap-macos-arm64.tar.gz llm-tap.app
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.name }}.tar.gz
+          files: llm-tap-macos-arm64.tar.gz
 
   build-windows:
     runs-on: windows-latest
