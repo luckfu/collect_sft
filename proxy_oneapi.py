@@ -113,6 +113,7 @@ class ProxyServer:
         self.port = port
         self.log_level = log_level
         self.runner: Optional[web.AppRunner] = None
+        self.session: Optional[aiohttp.ClientSession] = None
         self.app.on_startup.append(self.init_async_resources)
 
     async def init_async_resources(self, app):
@@ -125,6 +126,9 @@ class ProxyServer:
         await init_db_path("calls.db")
         await init_calls_table("calls.db")
         await self.async_logger.info("Database initialized")
+        # Reuse a single ClientSession for all upstream requests so connections
+        # are pooled and DNS/TCP handshakes aren't repeated per request.
+        self.session = aiohttp.ClientSession()
 
     async def start(self):
         self.runner = web.AppRunner(self.app)
@@ -139,6 +143,9 @@ class ProxyServer:
 
     async def stop(self):
         """Cleanly stop the AppRunner so the listening socket is released."""
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
         if self.runner is not None:
             await self.runner.cleanup()
             self.runner = None
@@ -175,66 +182,66 @@ class ProxyServer:
         start_time = asyncio.get_event_loop().time()
 
         try:
-            async with aiohttp.ClientSession() as session:
-                timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_connect=30, sock_read=600)
+            session = self.session
+            timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_connect=30, sock_read=600)
 
-                # GET 请求（如 /v1/models 模型列表）：纯透传，不保存
-                if method == "GET":
-                    async with session.get(upstream_url, headers=upstream_headers, timeout=timeout) as resp:
-                        body = await resp.read()
-                        await self.async_logger.info(f"   GET response: {resp.status}")
-                        return web.Response(status=resp.status, body=body,
-                                            content_type="application/json")
+            # GET 请求（如 /v1/models 模型列表）：纯透传，不保存
+            if method == "GET":
+                async with session.get(upstream_url, headers=upstream_headers, timeout=timeout) as resp:
+                    body = await resp.read()
+                    await self.async_logger.info(f"   GET response: {resp.status}")
+                    return web.Response(status=resp.status, body=body,
+                                        content_type="application/json")
 
-                # POST 请求（对话/补全/嵌入等）
-                request_body = await request.read()
-                if len(request_body) > 8000000:
-                    return web.Response(status=413, text=json.dumps({"error": "请求体过大"}))
+            # POST 请求（对话/补全/嵌入等）
+            request_body = await request.read()
+            if len(request_body) > 8000000:
+                return web.Response(status=413, text=json.dumps({"error": "请求体过大"}))
 
-                # 解析请求
-                try:
-                    request_data = json.loads(request_body)
-                except json.JSONDecodeError:
-                    request_data = {}
-                model_id = request_data.get("model", "unknown")
-                is_stream = request_data.get("stream", False)
+            # 解析请求
+            try:
+                request_data = json.loads(request_body)
+            except json.JSONDecodeError:
+                request_data = {}
+            model_id = request_data.get("model", "unknown")
+            is_stream = request_data.get("stream", False)
 
-                raw_request_body = request_body
-                agent_meta = extract_agent_metadata(request.headers)
+            raw_request_body = request_body
+            agent_meta = extract_agent_metadata(request.headers)
 
-                started_at = datetime.now()
-                call_id = f"call-{started_at.strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
+            started_at = datetime.now()
+            call_id = f"call-{started_at.strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
 
-                await self.async_logger.info(
-                    f"📝 {protocol}: host={host}, model={model_id}, stream={is_stream}, call_id={call_id}"
-                )
+            await self.async_logger.info(
+                f"📝 {protocol}: host={host}, model={model_id}, stream={is_stream}, call_id={call_id}"
+            )
 
-                first_token_at = None
+            first_token_at = None
 
-                async with session.post(upstream_url, headers=upstream_headers,
-                                        data=request_body, timeout=timeout) as resp:
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    await self.async_logger.info(f"Upstream response: {resp.status}, elapsed {elapsed:.2f}s")
+            async with session.post(upstream_url, headers=upstream_headers,
+                                    data=request_body, timeout=timeout) as resp:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                await self.async_logger.info(f"Upstream response: {resp.status}, elapsed {elapsed:.2f}s")
 
-                    # 失败：只记日志，不存文件
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        await self.async_logger.error(f"Upstream error: {resp.status}, {error_text[:500]}")
-                        return web.Response(status=resp.status, text=error_text,
-                                            content_type="application/json")
+                # 失败：只记日志，不存文件
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    await self.async_logger.error(f"Upstream error: {resp.status}, {error_text[:500]}")
+                    return web.Response(status=resp.status, text=error_text,
+                                        content_type="application/json")
 
-                    # ========== 流式 ==========
-                    if is_stream:
-                        return await self._handle_stream(
-                            request, resp, protocol, call_id, host, model_id,
-                            raw_request_body, started_at, first_token_at, agent_meta
-                        )
-                    # ========== 非流式 ==========
-                    else:
-                        return await self._handle_non_stream(
-                            resp, protocol, call_id, host, model_id,
-                            raw_request_body, request, started_at, agent_meta
-                        )
+                # ========== 流式 ==========
+                if is_stream:
+                    return await self._handle_stream(
+                        request, resp, protocol, call_id, host, model_id,
+                        raw_request_body, started_at, first_token_at, agent_meta
+                    )
+                # ========== 非流式 ==========
+                else:
+                    return await self._handle_non_stream(
+                        resp, protocol, call_id, host, model_id,
+                        raw_request_body, request, started_at, agent_meta
+                    )
         except aiohttp.ClientError as e:
             await self.async_logger.error(f"Network error: {e}")
             return web.Response(status=502, text=json.dumps({"error": f"Upstream connection failed: {str(e)}"}))
@@ -359,18 +366,36 @@ class ProxyServer:
                                  host: str, model_id: str, raw_request_body: bytes,
                                  orig_request: web.Request, started_at: datetime,
                                  agent_meta: dict) -> web.Response:
-        """处理非流式响应：原样返回 + 保存"""
-        response_json = await resp.json()
+        """处理非流式响应：原样返回 + 保存
 
-        if protocol == "openai-chat":
-            stop_reason = ((response_json.get("choices") or [{}])[0].get("finish_reason"))
-        elif protocol == "anthropic-messages":
-            stop_reason = response_json.get("stop_reason")
-        elif protocol == "openai-responses":
-            stop_reason = response_json.get("status")
+        先读 raw bytes 再 try json：有些上游对 stream=false 请求仍返回
+        text/event-stream，直接 resp.json() 会抛 ContentTypeError 导致请求
+        500 失败且数据丢失。读 bytes 后容错解析，解析失败也原样透传给客户端。
+        """
+        raw_bytes = await resp.read()
+        response_json = None
+        try:
+            response_json = json.loads(raw_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # 上游返回非 JSON（如 SSE 流 / 纯文本错误），原样透传不丢数据
+            await self.async_logger.warning(
+                f"Non-stream response is not JSON (content-type={resp.headers.get('Content-Type')!r}), "
+                f"passing through {len(raw_bytes)} bytes as-is for {call_id}"
+            )
+
+        if response_json is not None:
+            if protocol == "openai-chat":
+                stop_reason = ((response_json.get("choices") or [{}])[0].get("finish_reason"))
+            elif protocol == "anthropic-messages":
+                stop_reason = response_json.get("stop_reason")
+            elif protocol == "openai-responses":
+                stop_reason = response_json.get("status")
+            else:
+                stop_reason = None
         else:
             stop_reason = None
 
+        # 只要上游 200 就保存（非 JSON 时 response_body 用原始文本）
         try:
             await save_raw_call(
                 "calls.db", call_id=call_id, protocol=protocol,
@@ -379,15 +404,20 @@ class ProxyServer:
                 upstream_model=model_id, client_model_alias=model_id,
                 started_at=started_at, finished_at=datetime.now(),
                 upstream_status=200, stop_reason=stop_reason,
-                response_body=response_json, is_stream=False, **agent_meta,
+                response_body=(response_json if response_json is not None
+                                else {"_raw": raw_bytes.decode("utf-8", errors="replace")}),
+                is_stream=False, **agent_meta,
             )
             await self.async_logger.info(f"Non-stream raw saved: {call_id}")
         except Exception as e:
             await self.async_logger.error(f"Failed to save non-stream raw: {e}")
 
-        return web.Response(status=200,
-                            body=json.dumps(response_json, ensure_ascii=False).encode("utf-8"),
-                            content_type="application/json")
+        # 原样返回：JSON 重新序列化保证格式；非 JSON 直接回 raw bytes
+        if response_json is not None:
+            body = json.dumps(response_json, ensure_ascii=False).encode("utf-8")
+            return web.Response(status=200, body=body, content_type="application/json")
+        return web.Response(status=200, body=raw_bytes,
+                            content_type=resp.headers.get("Content-Type", "application/octet-stream"))
 
     # ========== 前端 Web UI ==========
 
@@ -476,6 +506,31 @@ class ProxyServer:
             "call": call_data,
         })
 
+    async def handle_api_call_delete(self, request: web.Request) -> web.Response:
+        """删除调用记录：同时删 DB 行和 JSON 文件"""
+        call_id = request.match_info["call_id"]
+
+        async with aiosqlite.connect("calls.db") as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT raw_path FROM calls WHERE call_id = ?", (call_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return web.json_response({"error": "not found"}, status=404)
+
+            raw_path = row["raw_path"]
+            await conn.execute("DELETE FROM calls WHERE call_id = ?", (call_id,))
+            await conn.commit()
+
+        # 删除 JSON 文件（文件不存在不算错）
+        if raw_path and os.path.exists(raw_path):
+            try:
+                os.remove(raw_path)
+            except OSError as e:
+                await self.async_logger.warning(f"Failed to remove {raw_path}: {e}")
+
+        await self.async_logger.info(f"Call deleted: {call_id}")
+        return web.json_response({"deleted": call_id})
+
     async def handle_api_stats(self, request: web.Request) -> web.Response:
         """统计概览 API"""
         async with aiosqlite.connect("calls.db") as conn:
@@ -556,6 +611,10 @@ tr:hover { background: #f8f9fa; cursor: pointer; }
 .filters { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .filters select, .filters input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
 .filters button { padding: 8px 16px; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+.action-cell { width: 88px; text-align: right; }
+.danger-btn { padding: 6px 10px; border: 1px solid #dc3545; background: #fff; color: #dc3545; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.danger-btn:hover { background: #dc3545; color: #fff; }
+.danger-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; }
 .pagination button { padding: 6px 12px; border: 1px solid #ddd; background: #fff; border-radius: 6px; cursor: pointer; }
 .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -564,6 +623,7 @@ tr:hover { background: #f8f9fa; cursor: pointer; }
 .modal { background: #fff; border-radius: 8px; width: 100%; max-width: 1000px; max-height: 90vh; overflow: hidden; display: flex; flex-direction: column; }
 .modal-header { padding: 16px 24px; border-bottom: 1px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center; }
 .modal-header h2 { font-size: 16px; }
+.modal-actions { display: flex; align-items: center; gap: 12px; }
 .modal-close { font-size: 24px; cursor: pointer; color: #999; }
 .modal-body { overflow-y: auto; padding: 24px; }
 .detail-section { margin-bottom: 24px; }
@@ -609,6 +669,7 @@ tr:hover { background: #f8f9fa; cursor: pointer; }
           <tr>
             <th data-i18n="colTime">时间</th><th>Host</th><th data-i18n="colProtocol">协议</th><th data-i18n="colModel">模型</th>
             <th data-i18n="colStatus">状态</th><th data-i18n="colDuration">耗时</th><th data-i18n="colFirstToken">首Token</th><th data-i18n="colStream">流式</th>
+            <th class="action-cell" data-i18n="colActions">操作</th>
           </tr>
         </thead>
         <tbody id="calls-tbody"></tbody>
@@ -638,7 +699,10 @@ tr:hover { background: #f8f9fa; cursor: pointer; }
   <div class="modal">
     <div class="modal-header">
       <h2 id="modal-title" data-i18n="callDetail">调用详情</h2>
-      <span class="modal-close" onclick="closeModal()">&times;</span>
+      <div class="modal-actions">
+        <button id="modal-delete-btn" class="danger-btn" onclick="deleteCall(event, currentDetailCallId, true)" data-i18n="delete">删除</button>
+        <span class="modal-close" onclick="closeModal()">&times;</span>
+      </div>
     </div>
     <div class="modal-body" id="modal-body"></div>
   </div>
@@ -651,7 +715,7 @@ const i18n = {
     allProtocols: '全部协议', allStatus: '全部状态', success: '成功', error: '失败',
     search: '查询', modelPh: '模型',
     colTime: '时间', colProtocol: '协议', colModel: '模型', colStatus: '状态',
-    colDuration: '耗时', colFirstToken: '首Token', colStream: '流式',
+    colDuration: '耗时', colFirstToken: '首Token', colStream: '流式', colActions: '操作',
     prevPage: '上一页', nextPage: '下一页',
     callDetail: '调用详情', metadata: '元数据', request: '请求', response: '响应',
     headersSanitized: 'Headers (脱敏)',
@@ -661,13 +725,14 @@ const i18n = {
     colCount: '调用数', colAvgDuration: '平均耗时(ms)',
     totalCalls: '总调用数', successCalls: '成功调用', avgDuration: '平均耗时', avgFirstToken: '平均首Token',
     streamBadge: '流式',
+    delete: '删除', deleteConfirm: '确定删除这条记录？', deleteBtn: '删除', deleted: '已删除',
   },
   en: {
     title: 'Data Collection', tabList: 'Calls', tabStats: 'Stats',
     allProtocols: 'All Protocols', allStatus: 'All Status', success: 'Success', error: 'Error',
     search: 'Search', modelPh: 'Model',
     colTime: 'Time', colProtocol: 'Protocol', colModel: 'Model', colStatus: 'Status',
-    colDuration: 'Duration', colFirstToken: 'First Token', colStream: 'Stream',
+    colDuration: 'Duration', colFirstToken: 'First Token', colStream: 'Stream', colActions: 'Actions',
     prevPage: 'Prev', nextPage: 'Next',
     callDetail: 'Call Detail', metadata: 'Metadata', request: 'Request', response: 'Response',
     headersSanitized: 'Headers (sanitized)',
@@ -677,6 +742,7 @@ const i18n = {
     colCount: 'Count', colAvgDuration: 'Avg Duration (ms)',
     totalCalls: 'Total Calls', successCalls: 'Success', avgDuration: 'Avg Duration', avgFirstToken: 'Avg First Token',
     streamBadge: 'Stream',
+    delete: 'Delete', deleteConfirm: 'Delete this record?', deleteBtn: 'Delete', deleted: 'Deleted',
   }
 };
 
@@ -709,6 +775,7 @@ function applyI18n() {
 
 let currentPage = 1;
 let total = 0;
+let currentDetailCallId = null;
 const pageSize = 20;
 
 async function loadCalls() {
@@ -731,11 +798,13 @@ async function loadCalls() {
       <td>${r.duration_ms ? r.duration_ms+'ms' : '-'}</td>
       <td>${r.first_token_ms ? r.first_token_ms+'ms' : '-'}</td>
       <td>${r.is_stream ? '<span class="badge badge-stream">'+t('streamBadge')+'</span>' : '-'}</td>
+      <td class="action-cell"><button class="danger-btn" onclick="deleteCall(event, '${r.call_id}')">${t('delete')}</button></td>
     </tr>
-  `).join('') || '<tr><td colspan="8" style="text-align:center;color:#999;padding:40px">'+t('noData')+'</td></tr>';
-  document.getElementById('page-info').textContent = t('pageInfo')(currentPage, Math.ceil(total/pageSize), total);
+  `).join('') || '<tr><td colspan="9" style="text-align:center;color:#999;padding:40px">'+t('noData')+'</td></tr>';
+  const totalPages = Math.max(1, Math.ceil(total/pageSize));
+  document.getElementById('page-info').textContent = t('pageInfo')(currentPage, totalPages, total);
   document.getElementById('btn-prev').disabled = currentPage <= 1;
-  document.getElementById('btn-next').disabled = currentPage >= Math.ceil(total/pageSize);
+  document.getElementById('btn-next').disabled = currentPage >= totalPages;
 }
 
 function changePage(d) {
@@ -744,22 +813,55 @@ function changePage(d) {
   loadCalls();
 }
 
+async function deleteCall(event, callId, closeAfterDelete = false) {
+  event.stopPropagation();
+  if (!callId) return;
+  if (!confirm(t('deleteConfirm') + '\\n' + callId)) return;
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/calls/' + encodeURIComponent(callId), { method: 'DELETE' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    total = Math.max(0, total - 1);
+    currentPage = Math.min(currentPage, Math.max(1, Math.ceil(total / pageSize)));
+    if (closeAfterDelete) closeModal();
+    await loadCalls();
+    if (document.getElementById('view-stats').style.display !== 'none') loadStats();
+  } catch (err) {
+    alert((err && err.message) ? err.message : String(err));
+    btn.disabled = false;
+  }
+}
+
 async function showDetail(callId) {
+  currentDetailCallId = callId;
+  document.getElementById('modal-delete-btn').disabled = false;
   const res = await fetch('/api/calls/' + callId);
   const data = await res.json();
   const call = data.call || {};
   const meta = call.meta || data.meta || {};
   document.getElementById('modal-title').textContent = t('callDetail');
+  // Escape HTML so JSON content containing <script>/<b>/etc is shown as text,
+  // not rendered as HTML. Without this, markdown/HTML inside response bodies
+  // breaks the <pre> block and messes up the modal layout.
+  function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function preBlock(obj) { return '<pre>' + esc(JSON.stringify(obj, null, 2)) + '</pre>'; }
   let html = '';
-  html += '<div class="detail-section"><h3>'+t('metadata')+'</h3><pre>' + JSON.stringify(meta, null, 2) + '</pre></div>';
-  if (call.request) html += '<div class="detail-section"><h3>'+t('request')+'</h3><pre>' + JSON.stringify(call.request, null, 2) + '</pre></div>';
-  if (call.response) html += '<div class="detail-section"><h3>'+t('response')+'</h3><pre>' + JSON.stringify(call.response, null, 2) + '</pre></div>';
-  if (call.headers) html += '<div class="detail-section"><h3>'+t('headersSanitized')+'</h3><pre>' + JSON.stringify(call.headers, null, 2) + '</pre></div>';
+  html += '<div class="detail-section"><h3>'+t('metadata')+'</h3>' + preBlock(meta) + '</div>';
+  if (call.request) html += '<div class="detail-section"><h3>'+t('request')+'</h3>' + preBlock(call.request) + '</div>';
+  if (call.response) html += '<div class="detail-section"><h3>'+t('response')+'</h3>' + preBlock(call.response) + '</div>';
+  if (call.headers) html += '<div class="detail-section"><h3>'+t('headersSanitized')+'</h3>' + preBlock(call.headers) + '</div>';
   document.getElementById('modal-body').innerHTML = html;
   document.getElementById('modal').classList.add('show');
 }
 
-function closeModal() { document.getElementById('modal').classList.remove('show'); }
+function closeModal() {
+  currentDetailCallId = null;
+  document.getElementById('modal').classList.remove('show');
+}
 
 async function loadStats() {
   const res = await fetch('/api/stats');
@@ -810,6 +912,7 @@ def _register_routes(server: "ProxyServer") -> None:
     server.app.router.add_get("/", server.handle_index)
     server.app.router.add_get("/api/calls", server.handle_api_calls)
     server.app.router.add_get("/api/calls/{call_id}", server.handle_api_call_detail)
+    server.app.router.add_delete("/api/calls/{call_id}", server.handle_api_call_delete)
     server.app.router.add_get("/api/stats", server.handle_api_stats)
     server.app.router.add_route("*", "/{path_info:.*}", server.handle_proxy)
 

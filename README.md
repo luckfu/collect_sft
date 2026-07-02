@@ -181,12 +181,35 @@ Organized by host + date. Each file is one complete call.
 
 Anthropic's `thinking` block (with `signature`), `tool_use` block, `tool_result` block — all preserved as-is.
 
+## Harness Dataset Export
+
+`export_harness_dataset.py` converts raw calls into a provider-neutral agent harness trajectory JSONL format. The canonical format preserves messages, tool calls, tool results, reasoning, harness metadata, and raw protocol fragments so it can later be compiled to OpenAI, ShareGPT, ChatML, TRL, LLaMA-Factory, or other training formats.
+
+Inspect exportable data:
+
+```bash
+python export_harness_dataset.py inspect --preview 3
+```
+
+Export canonical JSONL:
+
+```bash
+python export_harness_dataset.py export --out exports/harness.jsonl
+```
+
+By default, the exporter reads the desktop app database at `~/.llm-tap/calls.db`. To inspect the development database in the current directory:
+
+```bash
+python export_harness_dataset.py --db calls.db inspect
+```
+
 ## Project Structure
 
 ```
 llm-tap/
 ├── proxy_oneapi.py        # Transparent proxy server
 ├── raw_storage.py         # Faithful call storage (+ event hook)
+├── export_harness_dataset.py # Canonical harness trajectory exporter
 ├── stream_merger.py       # Stream response merging (OpenAI Chat / Anthropic Messages)
 ├── utils.py               # Async logging + database init
 ├── tray_app.py            # Menu-bar / system-tray app entry point

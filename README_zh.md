@@ -181,12 +181,35 @@ data/calls/
 
 Anthropic 协议的 `thinking` block（含 `signature`）、`tool_use` block、`tool_result` block 等全部原样保留。
 
+## Harness 训练数据导出
+
+`export_harness_dataset.py` 可以把原始调用转换为通用的 agent harness trajectory JSONL。该格式不绑定 OpenAI，保留 message、tool call、tool result、reasoning、harness 元数据和原始片段，后续可再编译为 OpenAI、ShareGPT、ChatML、TRL、LLaMA-Factory 等训练框架格式。
+
+先检查可导出数据：
+
+```bash
+python export_harness_dataset.py inspect --preview 3
+```
+
+导出 canonical JSONL：
+
+```bash
+python export_harness_dataset.py export --out exports/harness.jsonl
+```
+
+默认读取桌面应用数据目录 `~/.llm-tap/calls.db`。如果要读取当前目录的开发数据库：
+
+```bash
+python export_harness_dataset.py --db calls.db inspect
+```
+
 ## 项目结构
 
 ```
 llm-tap/
 ├── proxy_oneapi.py        # 透明代理服务器
 ├── raw_storage.py         # 原始调用保真存储（含事件钩子）
+├── export_harness_dataset.py # 通用 harness trajectory 数据导出
 ├── stream_merger.py       # 流式响应整合（OpenAI Chat / Anthropic Messages）
 ├── utils.py               # 异步日志 + 数据库初始化
 ├── tray_app.py            # 菜单栏 / 系统托盘应用入口

@@ -33,6 +33,23 @@ ACTIVE_DURATION = 2.0  # seconds the icon stays "active" after a captured call
 _RESAMPLE = getattr(Image, "LANCZOS", None) or Image.Resampling.LANCZOS
 
 
+def _lan_ip() -> str:
+    """Best-effort LAN IP of this machine (for displaying in the tray menu).
+
+    Opens a UDP socket to a public address without sending anything; the OS
+    picks the LAN interface address for the route. Falls back to 127.0.0.1.
+    """
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def _load_font(size: int):
     """Load a bold TTF for the count badge, falling back to PIL's default."""
     for p in (
@@ -67,6 +84,7 @@ def _save_settings(settings: dict) -> None:
 class TrayApp:
     def __init__(self, port: int = DEFAULT_PORT):
         self.port = port
+        self.lan_ip = _lan_ip()
         self.count = 0
         self.active_until = 0.0
         self.lock = threading.Lock()
@@ -79,9 +97,9 @@ class TrayApp:
                 pystray.MenuItem("llm-tap", None, enabled=False),
                 pystray.MenuItem(lambda _: f"Captured: {self.count}", None, enabled=False),
                 pystray.MenuItem(lambda _: f"Port: {self.port}", None, enabled=False),
-                pystray.MenuItem(lambda _: f"http://127.0.0.1:{self.port}/", None, enabled=False),
+                pystray.MenuItem(lambda _: f"http://{self.lan_ip}:{self.port}/", None, enabled=False),
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Open Web UI", self._open_web),
+                pystray.MenuItem("Browse Data", self._open_web),
                 pystray.MenuItem("Settings...", self._open_settings),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit", self._quit),
@@ -186,6 +204,13 @@ class TrayApp:
     def _refresh_icon(self) -> None:
         active = time.time() < self.active_until
         self.icon.icon = self._draw_icon(active=active, count=self.count)
+        # Force the menu to re-evaluate its dynamic (lambda) item labels.
+        # Without this, macOS caches the old "Captured: N" text and only
+        # refreshes it much later, when the menu is next opened.
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
 
     # ---------- callback fired from the proxy's asyncio thread ----------
 
@@ -193,6 +218,7 @@ class TrayApp:
         with self.lock:
             self.count += 1
             self.active_until = time.time() + ACTIVE_DURATION
+        print(f"[llm-tap] captured #{self.count}: {meta.get('call_id')}", flush=True)
         # pystray icon update is thread-safe; runs on main thread
         self._refresh_icon()
         # revert to idle after the active window

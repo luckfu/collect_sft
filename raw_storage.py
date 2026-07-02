@@ -260,8 +260,11 @@ async def save_raw_call(
     for cb in _call_saved_callbacks:
         try:
             cb(meta)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger("raw_storage").error(
+                f"call-saved callback {cb!r} raised: {e!r}"
+            )
 
     return file_path
 
