@@ -279,6 +279,16 @@ Visit `http://127.0.0.1:12345/` in browser for a management interface with:
 - Statistics overview (by host, protocol, model)
 - Chinese/English language switch
 
+Data browsing is protected separately from transparent forwarding. Without `ui_tokens`, the Web UI and `/api/*` data endpoints are only available from local loopback (`localhost` / `127.0.0.1` / `::1`). For public deployment, add `ui_tokens` to `config.json`:
+
+```json
+{
+  "ui_tokens": ["change-me"]
+}
+```
+
+Then open `http://host:12345/?token=change-me` once to set the browser cookie. API clients can also send `Authorization: Bearer change-me`.
+
 ### Call List
 
 ![Call List](docs/screenshots/overview-en.png)

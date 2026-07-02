@@ -279,6 +279,16 @@ LLM_TAP_DATA_DIR=/path/to/llm-tap-data python3 tray_app.py
 - 统计概览（按 host、协议、模型统计）
 - 中英文切换
 
+数据浏览访问控制和透明转发是分开的。未配置 `ui_tokens` 时，Web 管理界面和 `/api/*` 数据接口只允许本机回环地址（`localhost` / `127.0.0.1` / `::1`）访问。公网部署时请在 `config.json` 中配置：
+
+```json
+{
+  "ui_tokens": ["change-me"]
+}
+```
+
+然后访问一次 `http://host:12345/?token=change-me` 写入浏览器 cookie。API 客户端也可以发送 `Authorization: Bearer change-me`。
+
 ### 调用列表
 
 ![调用列表](docs/screenshots/overview-en.png)

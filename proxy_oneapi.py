@@ -24,6 +24,7 @@ import traceback
 import argparse
 import uuid
 import os
+import ipaddress
 import aiohttp
 import aiosqlite
 from aiohttp import web
@@ -101,6 +102,93 @@ def verify_auth(request: web.Request, config: dict) -> bool:
             return True
 
     return False
+
+
+def _configured_ui_tokens(config: dict) -> list:
+    """Tokens that protect the data browser.
+
+    ui_tokens is preferred. Falling back to auth_tokens keeps older configs
+    protected if users already configured proxy-side tokens.
+    """
+    return list(config.get("ui_tokens") or config.get("web_tokens") or config.get("auth_tokens") or [])
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = (host or "").lower()
+    if host.startswith("["):
+        end = host.find("]")
+        host = host[1:end] if end != -1 else host.strip("[]")
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_local_browser_request(request: web.Request) -> bool:
+    if not _is_loopback_host(request.host):
+        return False
+    try:
+        return ipaddress.ip_address(request.remote or "").is_loopback
+    except ValueError:
+        return False
+
+
+def _request_ui_token(request: web.Request) -> Optional[str]:
+    token = request.query.get("token")
+    if token:
+        return token
+    token = request.cookies.get("llm_tap_ui_token")
+    if token:
+        return token
+    token = request.headers.get("x-ui-token") or request.headers.get("x-api-key")
+    if token:
+        return token
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        return auth_header.split(" ", 1)[1]
+    return None
+
+
+def verify_ui_auth(request: web.Request, config: dict) -> bool:
+    """Protect data browser pages and APIs without changing proxy forwarding."""
+    tokens = _configured_ui_tokens(config)
+    if not tokens:
+        return _is_local_browser_request(request)
+    return _request_ui_token(request) in tokens
+
+
+def _maybe_set_ui_cookie(resp: web.StreamResponse, request: web.Request, config: dict) -> None:
+    token = request.query.get("token")
+    if token and token in _configured_ui_tokens(config):
+        resp.set_cookie(
+            "llm_tap_ui_token",
+            token,
+            max_age=30 * 24 * 3600,
+            httponly=True,
+            samesite="Lax",
+        )
+
+
+def _ui_unauthorized_json() -> web.Response:
+    return web.json_response({"error": "unauthorized data browser access"}, status=401)
+
+
+def _ui_unauthorized_html() -> web.Response:
+    return web.Response(
+        status=401,
+        content_type="text/html",
+        text="""<!doctype html>
+<html><head><meta charset="utf-8"><title>llm-tap locked</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:64px auto;line-height:1.6">
+<h2>llm-tap data browser is locked</h2>
+<p>Remote data browsing requires <code>ui_tokens</code> in <code>config.json</code>.</p>
+<p>Open <code>/?token=YOUR_TOKEN</code> once to set a browser cookie, or send <code>Authorization: Bearer YOUR_TOKEN</code> for API access.</p>
+</body></html>""",
+    )
 
 
 # ========== 代理服务器 ==========
@@ -423,10 +511,16 @@ class ProxyServer:
 
     async def handle_index(self, request: web.Request) -> web.Response:
         """前端管理界面"""
-        return web.Response(text=INDEX_HTML, content_type="text/html")
+        if not verify_ui_auth(request, self.config):
+            return _ui_unauthorized_html()
+        resp = web.Response(text=INDEX_HTML, content_type="text/html")
+        _maybe_set_ui_cookie(resp, request, self.config)
+        return resp
 
     async def handle_api_calls(self, request: web.Request) -> web.Response:
         """调用列表 API：支持分页、筛选"""
+        if not verify_ui_auth(request, self.config):
+            return _ui_unauthorized_json()
         page = int(request.query.get("page", 1))
         page_size = int(request.query.get("page_size", 20))
         host = request.query.get("host", "")
@@ -481,6 +575,8 @@ class ProxyServer:
 
     async def handle_api_call_detail(self, request: web.Request) -> web.Response:
         """调用详情 API：读取完整 JSON 文件"""
+        if not verify_ui_auth(request, self.config):
+            return _ui_unauthorized_json()
         call_id = request.match_info["call_id"]
 
         async with aiosqlite.connect("calls.db") as conn:
@@ -508,6 +604,8 @@ class ProxyServer:
 
     async def handle_api_call_delete(self, request: web.Request) -> web.Response:
         """删除调用记录：同时删 DB 行和 JSON 文件"""
+        if not verify_ui_auth(request, self.config):
+            return _ui_unauthorized_json()
         call_id = request.match_info["call_id"]
 
         async with aiosqlite.connect("calls.db") as conn:
@@ -533,6 +631,8 @@ class ProxyServer:
 
     async def handle_api_stats(self, request: web.Request) -> web.Response:
         """统计概览 API"""
+        if not verify_ui_auth(request, self.config):
+            return _ui_unauthorized_json()
         async with aiosqlite.connect("calls.db") as conn:
             conn.row_factory = aiosqlite.Row
 
