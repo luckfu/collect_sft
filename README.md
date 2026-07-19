@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-LLM transparent proxy + data collection system.
+**A local transparent proxy that captures real LLM conversations, then lets you filter, inspect, and export training datasets.**
 
 Change the client's LLM request URL from `https://api.xxx.com` to `http://127.0.0.1:12345/api.xxx.com`, and the proxy transparently forwards requests/responses while saving each complete call as-is for downstream training data construction.
 
