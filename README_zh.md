@@ -19,7 +19,7 @@
 
 ## 社区交流
 
-- [在 LINUX DO 讨论 llm-tap](https://linux.do/t/topic/2614142)
+- [在 LINUX DO 讨论 llm-tap](https://linux.do/t/topic/2614676/5)
 
 ## 工作原理
 
