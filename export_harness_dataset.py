@@ -22,23 +22,38 @@ DEFAULT_DATA_DIR = os.path.expanduser("~/.llm-tap")
 DEFAULT_DB_PATH = os.path.join(DEFAULT_DATA_DIR, "calls.db")
 
 
-def load_call_rows(db_path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def load_call_rows(
+    db_path: str,
+    limit: Optional[int] = None,
+    call_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     sql = """
         SELECT call_id, protocol, upstream_provider, upstream_model,
                started_at, finished_at, duration_ms, upstream_status,
                stop_reason, raw_path, is_stream
         FROM calls
-        ORDER BY started_at ASC
     """
-    if limit:
-        sql += " LIMIT ?"
-        params: Tuple[Any, ...] = (limit,)
-    else:
-        params = ()
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        params: Tuple[Any, ...] = ()
+        if call_ids is not None:
+            unique_call_ids = list(dict.fromkeys(call_ids))
+            if not unique_call_ids:
+                return []
+            conn.execute(
+                "CREATE TEMP TABLE selected_call_ids (call_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO selected_call_ids (call_id, ordinal) VALUES (?, ?)",
+                ((call_id, index) for index, call_id in enumerate(unique_call_ids)),
+            )
+            sql = sql.replace("FROM calls", "FROM calls JOIN selected_call_ids USING (call_id)")
+        sql += " ORDER BY started_at ASC"
+        if limit:
+            sql += " LIMIT ?"
+            params = (limit,)
         return [dict(row) for row in conn.execute(sql, params)]
     finally:
         conn.close()
@@ -434,8 +449,12 @@ def convert_call(row: Dict[str, Any], db_path: str) -> Tuple[Optional[Dict[str, 
     return None, f"unsupported_protocol:{protocol}"
 
 
-def iter_episodes(db_path: str, limit: Optional[int] = None):
-    for row in load_call_rows(db_path, limit=limit):
+def iter_episodes(
+    db_path: str,
+    limit: Optional[int] = None,
+    call_ids: Optional[List[str]] = None,
+):
+    for row in load_call_rows(db_path, limit=limit, call_ids=call_ids):
         episode, error = convert_call(row, db_path)
         yield row, episode, error
 
@@ -514,6 +533,7 @@ def minimal_window_units_for_episode(
 def inspect_window_budget(
     db_path: str,
     limit: Optional[int] = None,
+    call_ids: Optional[List[str]] = None,
     chars_per_token: float = 4.0,
     preview: int = 5,
 ) -> Dict[str, Any]:
@@ -522,7 +542,7 @@ def inspect_window_budget(
     calls = 0
     episodes = 0
 
-    for _, episode, error in iter_episodes(db_path, limit=limit):
+    for _, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
         calls += 1
         if error:
             skipped[error] += 1
@@ -561,6 +581,7 @@ def inspect_window_budget(
 def inspect_dataset(
     db_path: str,
     limit: Optional[int] = None,
+    call_ids: Optional[List[str]] = None,
     preview: int = 3,
     include_window_budget: bool = False,
     chars_per_token: float = 4.0,
@@ -581,7 +602,7 @@ def inspect_dataset(
         "previews": [],
     }
 
-    for row, episode, error in iter_episodes(db_path, limit=limit):
+    for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
         report["calls"] += 1
         report["protocols"][row.get("protocol")] += 1
         report["providers"][row.get("upstream_provider")] += 1
@@ -624,19 +645,26 @@ def inspect_dataset(
         report["window_budget"] = inspect_window_budget(
             db_path,
             limit=limit,
+            call_ids=call_ids,
             chars_per_token=chars_per_token,
             preview=preview,
         )
     return report
 
 
-def export_dataset(db_path: str, out_path: str, limit: Optional[int] = None, include_skipped: bool = False) -> Dict[str, Any]:
+def export_dataset(
+    db_path: str,
+    out_path: str,
+    limit: Optional[int] = None,
+    include_skipped: bool = False,
+    call_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     exported = 0
     skipped = Counter()
 
     def rows():
         nonlocal exported
-        for row, episode, error in iter_episodes(db_path, limit=limit):
+        for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
             if error:
                 skipped[error] += 1
                 continue
@@ -756,13 +784,14 @@ def export_sharegpt_dataset(
     include_skipped: bool = False,
     include_metadata: bool = False,
     include_tools: bool = True,
+    call_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     exported = 0
     skipped = Counter()
 
     def rows():
         nonlocal exported
-        for row, episode, error in iter_episodes(db_path, limit=limit):
+        for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
             if error:
                 skipped[error] += 1
                 continue
@@ -900,13 +929,14 @@ def export_tool_sft_dataset(
     limit: Optional[int] = None,
     include_skipped: bool = False,
     include_metadata: bool = False,
+    call_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     exported = 0
     skipped = Counter()
 
     def rows():
         nonlocal exported
-        for row, episode, error in iter_episodes(db_path, limit=limit):
+        for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
             if error:
                 skipped[error] += 1
                 continue
@@ -1094,13 +1124,14 @@ def export_openai_dataset(
     limit: Optional[int] = None,
     include_skipped: bool = False,
     include_metadata: bool = False,
+    call_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     exported = 0
     skipped = Counter()
 
     def rows():
         nonlocal exported
-        for row, episode, error in iter_episodes(db_path, limit=limit):
+        for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
             if error:
                 skipped[error] += 1
                 continue
@@ -1374,6 +1405,7 @@ def export_openai_windowed_dataset(
     max_seq_len: int = 4096,
     chars_per_token: float = 4.0,
     prefix_budget_ratio: float = 0.45,
+    call_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     exported = 0
     source_episodes = 0
@@ -1382,7 +1414,7 @@ def export_openai_windowed_dataset(
 
     def rows():
         nonlocal exported, source_episodes, max_estimated_units
-        for row, episode, error in iter_episodes(db_path, limit=limit):
+        for row, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
             if error:
                 skipped[error] += 1
                 continue
@@ -1427,6 +1459,372 @@ def export_openai_windowed_dataset(
     }
 
 
+def _split_think_content(content: str) -> Tuple[str, str]:
+    if not content.startswith("<think>\n"):
+        return "", content
+    end = content.find("\n</think>")
+    if end == -1:
+        return "", content
+    reasoning = content[len("<think>\n"):end]
+    visible = content[end + len("\n</think>"):].lstrip("\n")
+    return reasoning, visible
+
+
+def _tool_name(tool: Dict[str, Any]) -> Optional[str]:
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    return fn.get("name") or tool.get("name")
+
+
+def _used_tool_names(messages: List[Dict[str, Any]]) -> set[str]:
+    names = set()
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            fn = tool_call.get("function") or {}
+            name = fn.get("name") or tool_call.get("name")
+            if name:
+                names.add(name)
+    return names
+
+
+def _window_tools(episode: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    names = _used_tool_names(messages)
+    if not names:
+        return []
+    return [
+        tool for tool in episode.get("tools") or []
+        if _tool_name(tool) in names
+    ]
+
+
+def _window_metadata(episode: Dict[str, Any], window: Dict[str, Any], schema: str) -> Dict[str, Any]:
+    original = window.get("metadata") or {}
+    return {
+        "id": episode.get("id"),
+        "schema": schema,
+        "source": episode.get("source"),
+        "harness": episode.get("harness"),
+        "labels": episode.get("labels"),
+        "stats": episode.get("stats"),
+        "window": copy.deepcopy(original.get("window") or {}),
+    }
+
+
+def _canonical_window_from_openai(
+    episode: Dict[str, Any],
+    window: Dict[str, Any],
+) -> Dict[str, Any]:
+    messages = window.get("messages") or []
+    canonical_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            canonical_messages.append({
+                "type": "tool_result",
+                "role": "tool",
+                "tool_call_id": message.get("tool_call_id"),
+                "name": message.get("name"),
+                "content": as_text(message.get("content")),
+                "source": "context_window",
+            })
+            continue
+
+        content = as_text(message.get("content"))
+        reasoning, visible = _split_think_content(content) if role == "assistant" else ("", content)
+        out: Dict[str, Any] = {
+            "type": "message",
+            "role": role,
+            "content": visible,
+            "source": "context_window",
+        }
+        if reasoning:
+            out["reasoning"] = reasoning
+        if message.get("tool_calls"):
+            out["tool_calls"] = copy.deepcopy(message["tool_calls"])
+            if not visible and not reasoning:
+                out["type"] = "tool_call"
+        canonical_messages.append(out)
+
+    metadata = _window_metadata(episode, window, "llm-tap.harness_window.v1")
+    target_index = metadata["window"].get("target_message_index", len(messages) - 1)
+    return {
+        "schema": "llm-tap.harness_trajectory.v1",
+        "id": f"{episode.get('id')}-window-{target_index}",
+        "source": copy.deepcopy(episode.get("source")),
+        "harness": copy.deepcopy(episode.get("harness")),
+        "tools": copy.deepcopy(_window_tools(episode, messages)),
+        "messages": canonical_messages,
+        "labels": copy.deepcopy(episode.get("labels")),
+        "quality": {"skip": False, "skip_reason": None},
+        "stats": {
+            "message_count": len(canonical_messages),
+            "assistant_message_count": sum(1 for item in canonical_messages if item.get("role") == "assistant"),
+            "tool_call_count": sum(len(item.get("tool_calls") or []) for item in canonical_messages),
+            "tool_result_count": sum(1 for item in canonical_messages if item.get("role") == "tool"),
+        },
+        "window": metadata["window"],
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _tool_sft_window_from_openai(
+    episode: Dict[str, Any],
+    window: Dict[str, Any],
+    include_metadata: bool,
+) -> Dict[str, Any]:
+    messages = copy.deepcopy(window.get("messages") or [])
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning, visible = _split_think_content(as_text(message.get("content")))
+        if reasoning:
+            message["reasoning_content"] = reasoning
+            message["content"] = visible
+    item: Dict[str, Any] = {
+        "tools": [tool_definition_for_training(tool) for tool in _window_tools(episode, messages)],
+        "messages": messages,
+    }
+    if include_metadata:
+        item["metadata"] = _window_metadata(episode, window, "llm-tap.tool_sft_window.v1")
+    return item
+
+
+def _sharegpt_window_from_openai(
+    episode: Dict[str, Any],
+    window: Dict[str, Any],
+    include_metadata: bool,
+    include_tools: bool,
+) -> Dict[str, Any]:
+    messages = window.get("messages") or []
+    conversations: List[Dict[str, str]] = []
+    tools = _window_tools(episode, messages)
+    if include_tools and tools:
+        tool_defs = [compact_raw(tool, drop_keys=("raw",)) for tool in tools]
+        conversations.append({
+            "from": "system",
+            "value": "<tools>\n" + json.dumps(tool_defs, ensure_ascii=False, indent=2) + "\n</tools>",
+        })
+
+    tool_names_by_id: Dict[str, str] = {}
+    role_map = {"system": "system", "user": "human", "assistant": "gpt", "tool": "observation"}
+    for message in messages:
+        role = message.get("role")
+        value = as_text(message.get("content"))
+        if role == "assistant":
+            reasoning, visible = _split_think_content(value)
+            if reasoning:
+                value = f"<reasoning>\n{reasoning}\n</reasoning>"
+                if visible:
+                    value += "\n\n" + visible
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            blocks = []
+            for tool_call in tool_calls:
+                fn = tool_call.get("function") or {}
+                name = fn.get("name") or "tool"
+                if tool_call.get("id"):
+                    tool_names_by_id[tool_call["id"]] = name
+                blocks.append(
+                    f"<tool_call name=\"{name}\">\n"
+                    f"{tool_arguments_string(fn.get('arguments'))}\n</tool_call>"
+                )
+            value = "\n\n".join(part for part in (value, "\n\n".join(blocks)) if part)
+        if role == "tool":
+            name = message.get("name") or tool_names_by_id.get(message.get("tool_call_id")) or "tool"
+            value = f"<tool_result name=\"{name}\">\n{value}\n</tool_result>"
+        if value:
+            conversations.append({"from": role_map.get(role, role or "unknown"), "value": value})
+
+    item: Dict[str, Any] = {
+        "id": f"{episode.get('id')}-window-{(window.get('metadata') or {}).get('window', {}).get('target_message_index', 0)}",
+        "conversations": conversations,
+    }
+    if include_metadata:
+        item["metadata"] = _window_metadata(episode, window, "llm-tap.sharegpt_window.v1")
+    return item
+
+
+def _openai_window_item(
+    episode: Dict[str, Any],
+    window: Dict[str, Any],
+    include_metadata: bool,
+) -> Dict[str, Any]:
+    item: Dict[str, Any] = {"messages": copy.deepcopy(window.get("messages") or [])}
+    if include_metadata:
+        item["metadata"] = _window_metadata(episode, window, "llm-tap.openai_chat_windowed.v1")
+    return item
+
+
+def _adapt_context_window(
+    episode: Dict[str, Any],
+    window: Dict[str, Any],
+    export_format: str,
+    include_metadata: bool,
+    include_tools: bool,
+) -> Dict[str, Any]:
+    if export_format == "canonical":
+        return _canonical_window_from_openai(episode, window)
+    if export_format == "tool_sft":
+        return _tool_sft_window_from_openai(episode, window, include_metadata)
+    if export_format == "sharegpt":
+        return _sharegpt_window_from_openai(episode, window, include_metadata, include_tools)
+    if export_format == "openai":
+        return _openai_window_item(episode, window, include_metadata)
+    raise ValueError(f"unsupported constrained format: {export_format}")
+
+
+def estimate_context_item_units(
+    item: Dict[str, Any],
+    export_format: str,
+    chars_per_token: float = 4.0,
+) -> int:
+    if export_format == "openai":
+        return estimate_openai_messages_units(item.get("messages") or [], chars_per_token)
+    if export_format == "tool_sft":
+        context = {"tools": item.get("tools") or [], "messages": item.get("messages") or []}
+    elif export_format == "sharegpt":
+        context = {"conversations": item.get("conversations") or []}
+    elif export_format == "canonical":
+        context = {"tools": item.get("tools") or [], "messages": item.get("messages") or []}
+    else:
+        raise ValueError(f"unsupported constrained format: {export_format}")
+    chars = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+    return max(1, int(math.ceil(chars / max(chars_per_token, 0.1))))
+
+
+def constrained_format_from_episode(
+    episode: Dict[str, Any],
+    export_format: str,
+    *,
+    max_seq_len: int = 4096,
+    chars_per_token: float = 4.0,
+    prefix_budget_ratio: float = 0.45,
+    include_metadata: bool = False,
+    include_tools: bool = True,
+) -> Tuple[List[Dict[str, Any]], Counter]:
+    message_budget = max_seq_len
+    final_items: List[Dict[str, Any]] = []
+    final_units: List[int] = []
+    final_skipped = Counter()
+
+    for _ in range(4):
+        windows, skipped = openai_windowed_from_episode(
+            episode,
+            max_seq_len=max(2, message_budget),
+            chars_per_token=chars_per_token,
+            prefix_budget_ratio=prefix_budget_ratio,
+            include_metadata=True,
+        )
+        adapted = [
+            _adapt_context_window(episode, window, export_format, include_metadata, include_tools)
+            for window in windows
+        ]
+        units = [estimate_context_item_units(item, export_format, chars_per_token) for item in adapted]
+        final_items, final_units, final_skipped = adapted, units, skipped
+        if not units or max(units) <= max_seq_len:
+            break
+
+        message_units = [
+            estimate_openai_messages_units(window.get("messages") or [], chars_per_token)
+            for window in windows
+        ]
+        reserve = max(
+            (max(0, item_units - window_units) for item_units, window_units in zip(units, message_units)),
+            default=0,
+        )
+        next_budget = max_seq_len - reserve
+        if next_budget >= message_budget:
+            next_budget = message_budget - max(1, max(units) - max_seq_len)
+        if next_budget < 2:
+            break
+        message_budget = next_budget
+
+    kept = []
+    for item, units in zip(final_items, final_units):
+        if units > max_seq_len:
+            final_skipped["formatted_window_exceeds_max_seq_len"] += 1
+            continue
+        if export_format == "canonical":
+            item["window"]["estimated_units"] = units
+            item["window"]["max_seq_len"] = max_seq_len
+        elif include_metadata:
+            item["metadata"]["window"]["estimated_units"] = units
+            item["metadata"]["window"]["max_seq_len"] = max_seq_len
+        kept.append(item)
+
+    if not kept:
+        final_skipped["empty_constrained_windows"] += 1
+    return kept, final_skipped
+
+
+def export_constrained_dataset(
+    db_path: str,
+    out_path: str,
+    export_format: str,
+    limit: Optional[int] = None,
+    include_skipped: bool = False,
+    include_metadata: bool = False,
+    include_tools: bool = True,
+    max_seq_len: int = 4096,
+    chars_per_token: float = 4.0,
+    prefix_budget_ratio: float = 0.45,
+    call_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    exported = 0
+    source_episodes = 0
+    max_estimated_units = 0
+    skipped = Counter()
+
+    def rows():
+        nonlocal exported, source_episodes, max_estimated_units
+        for _, episode, error in iter_episodes(db_path, limit=limit, call_ids=call_ids):
+            if error:
+                skipped[error] += 1
+                continue
+            assert episode is not None
+            if episode["quality"]["skip"] and not include_skipped:
+                skipped[episode["quality"]["skip_reason"]] += 1
+                continue
+            items, item_skipped = constrained_format_from_episode(
+                episode,
+                export_format,
+                max_seq_len=max_seq_len,
+                chars_per_token=chars_per_token,
+                prefix_budget_ratio=prefix_budget_ratio,
+                include_metadata=include_metadata,
+                include_tools=include_tools,
+            )
+            skipped.update(item_skipped)
+            if not items:
+                continue
+            source_episodes += 1
+            for item in items:
+                exported += 1
+                max_estimated_units = max(
+                    max_estimated_units,
+                    estimate_context_item_units(item, export_format, chars_per_token),
+                )
+                yield item
+
+    written = dump_json_array(out_path, rows()) if export_format == "sharegpt" else dump_jsonl(out_path, rows())
+    return {
+        "db_path": db_path,
+        "out_path": out_path,
+        "format": export_format,
+        "context_limited": True,
+        "include_metadata": include_metadata,
+        "include_tools": include_tools if export_format == "sharegpt" else None,
+        "max_seq_len": max_seq_len,
+        "token_budget_mode": "json_char_count_divisor",
+        "chars_per_token": chars_per_token,
+        "prefix_budget_ratio": prefix_budget_ratio,
+        "source_episodes": source_episodes,
+        "exported": exported,
+        "written": written,
+        "max_estimated_units": max_estimated_units,
+        "skipped": dict(skipped),
+    }
+
+
 def print_json(obj: Dict[str, Any]) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
@@ -1448,6 +1846,7 @@ def main() -> None:
     export_p.add_argument("--include-skipped", action="store_true", help="Include low-quality/skipped episodes")
     export_p.add_argument("--include-metadata", action="store_true", help="Include metadata in supported outputs")
     export_p.add_argument("--no-tools", action="store_true", help="Do not inject tool definitions into ShareGPT system turns")
+    export_p.add_argument("--context-limit", action="store_true", help="Apply per-record context limits to the selected format")
     export_p.add_argument("--max-seq-len", type=int, default=4096, help="Estimated max sequence length for windowed exports")
     export_p.add_argument("--chars-per-token", type=float, default=4.0, help="Heuristic character/token divisor for windowed exports")
     export_p.add_argument("--prefix-budget-ratio", type=float, default=0.45, help="Maximum window budget fraction reserved for fixed prefix in windowed exports")
@@ -1465,7 +1864,20 @@ def main() -> None:
             chars_per_token=args.chars_per_token,
         ))
     elif args.command == "export":
-        if args.format == "sharegpt":
+        if args.context_limit and args.format != "openai_windowed":
+            result = export_constrained_dataset(
+                db_path,
+                args.out,
+                args.format,
+                limit=args.limit,
+                include_skipped=args.include_skipped,
+                include_metadata=args.include_metadata,
+                include_tools=not args.no_tools,
+                max_seq_len=args.max_seq_len,
+                chars_per_token=args.chars_per_token,
+                prefix_budget_ratio=args.prefix_budget_ratio,
+            )
+        elif args.format == "sharegpt":
             result = export_sharegpt_dataset(
                 db_path,
                 args.out,

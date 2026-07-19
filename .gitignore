@@ -9,6 +9,7 @@ data/
 .waylog/
 .vscode/
 .claude/
+.codex/
 
 # PyInstaller build artifacts
 build/

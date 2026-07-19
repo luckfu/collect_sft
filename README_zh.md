@@ -6,6 +6,17 @@ LLM 透明代理 + 数据采集系统。
 
 把客户端的 LLM 请求 URL 从 `https://api.xxx.com` 改成 `http://127.0.0.1:12345/api.xxx.com`，代理自动透传请求/响应，同时原样保存每次完整调用，用于后续训练数据构建。
 
+## 从这里开始
+
+| 目标 | 入口 |
+|------|------|
+| 启动代理并连接客户端 | [快速开始](#快速开始) 和 [客户端配置示例](#客户端配置示例) |
+| 浏览已采集调用 | [Web 管理界面](#web-管理界面) |
+| 从选中的调用导出训练数据 | [Harness 训练数据导出](#harness-训练数据导出) |
+| 了解格式、筛选和上下文限制 | [训练数据导出设计](docs/dataset-export.md) |
+
+标准流程是：**启动代理 -> 把客户端指向代理 -> 正常使用客户端 -> 在 Web 界面选择调用 -> 检查并导出**。原始采集文件保留在当前数据目录，生成的数据集是独立的导出文件。
+
 ## 工作原理
 
 ```
@@ -60,7 +71,7 @@ LLM 透明代理 + 数据采集系统。
 **方式 B — 从源码运行**
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-app.txt
 python3 proxy_oneapi.py -p 12345
 ```
 
@@ -146,7 +157,7 @@ data/calls/
 
 按 host 分目录 + 日期分目录，每个文件是一次完整调用。
 
-### 单个文件结构
+### 单次调用文件
 
 ```json
 {
@@ -188,6 +199,18 @@ Anthropic 协议的 `thinking` block（含 `signature`）、`tool_use` block、`
 `export_harness_dataset.py` 可以把原始调用转换为通用的 agent harness trajectory JSONL。该格式不绑定 OpenAI，保留 message、tool call、tool result、reasoning、harness 元数据和原始片段，后续可再编译为 OpenAI、ShareGPT、ChatML、TRL、LLaMA-Factory 等训练框架格式。
 
 完整的导出原理、处理方法、滑窗策略和参数说明见 [训练数据导出设计](docs/dataset-export.md)。
+
+### 如何选择导出格式
+
+| 格式 | 适用情况 |
+|------|----------|
+| `canonical` | 需要保留最完整的、与服务商无关的中间数据，之后还要转换或审计。 |
+| `openai` | 训练加载器要求每行一个 OpenAI 风格的 `{"messages": [...]}` JSONL 对象。 |
+| `tool_sft` | 训练框架支持结构化工具调用和 `role=tool` 消息。 |
+| `sharegpt` | 训练加载器要求 ShareGPT JSON 数组和文本工具标签。 |
+| `openai_windowed` | 长轨迹需要按长度预算拆成多个以 assistant 为目标的样本。 |
+
+第一次导出时，建议先检查数据，再在 Web 界面选择调用；除非训练框架有特殊要求，优先使用 `openai` 或 `tool_sft`。如果每条样本都必须满足长度上限，启用 `--context-limit`。
 
 先检查可导出数据：
 
@@ -266,9 +289,10 @@ python export_harness_dataset.py --db calls.db inspect
 | `--include-skipped` | 关闭 | 默认跳过没有 assistant 输出等低质量样本；打开后会把这些样本也写出。 |
 | `--include-metadata` | 关闭 | 在支持的格式中额外写入源文件、模型、harness、标签和统计信息，主要用于调试溯源；正式训练通常不需要。 |
 | `--no-tools` | 关闭 | 仅对 `sharegpt` 生效。关闭 `<tools>...</tools>` 工具定义注入，但仍会保留工具调用/工具结果文本轨迹。 |
-| `--max-seq-len N` | `4096` | 仅对 `openai_windowed` 生效。窗口最大估算长度。 |
-| `--chars-per-token N` | `4.0` | 仅对 `openai_windowed` 生效。无 tokenizer 时用 `JSON 字符数 / N` 估算 token，数值越小越保守。 |
-| `--prefix-budget-ratio N` | `0.45` | 仅对 `openai_windowed` 生效。固定前缀最多占窗口预算的比例，避免超长 system prompt 挤掉历史。 |
+| `--context-limit` | 关闭 | 对 canonical、sharegpt、tool_sft 或 openai 启用单条记录上下文约束。 |
+| `--max-seq-len N` | `4096` | 对 `--context-limit` 或 `openai_windowed` 生效。每条记录最大估算长度。 |
+| `--chars-per-token N` | `4.0` | 对上下文约束生效。无 tokenizer 时用 `JSON 字符数 / N` 估算 token，数值越小越保守。 |
+| `--prefix-budget-ratio N` | `0.45` | 对上下文约束生效。固定前缀最多占窗口预算的比例，避免超长 system prompt 挤掉历史。 |
 
 格式说明：
 
@@ -303,6 +327,7 @@ python3 proxy_oneapi.py -p 12345 --log-level INFO
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-p, --port` | 12345 | 监听端口 |
+| `--bind` | `127.0.0.1` | 监听地址；也可通过 `config.json` 的 `bind` 设置 |
 | `--log-level` | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 
 ## 桌面应用（菜单栏 / 系统托盘）
@@ -334,16 +359,26 @@ LLM_TAP_DATA_DIR=/path/to/llm-tap-data python3 tray_app.py
 
 ## Web 管理界面
 
-浏览器访问 `http://127.0.0.1:12345/` 即可使用管理界面：
-- 调用列表，支持筛选（host、协议、模型、状态）
-- 调用详情查看（完整的请求/响应 JSON）
-- 统计概览（按 host、协议、模型统计）
-- 中英文切换
+浏览器访问 `http://127.0.0.1:12345/` 即可使用管理界面，主要流程是：
 
-数据浏览访问控制和透明转发是分开的。未配置 `ui_tokens` 时，Web 管理界面和 `/api/*` 数据接口只允许本机回环地址（`localhost` / `127.0.0.1` / `::1`）访问。公网部署时请在 `config.json` 中配置：
+1. 按 Host、模型、协议、状态或本地起止时间筛选调用。
+2. 选择单条调用、当前页，或当前筛选结果中的全部调用；选择会跨分页保留。
+3. 进入“数据导出”，检查所选记录，并查看质量和上下文预算摘要。
+4. 选择格式并导出；下载文件只包含所选调用 ID 对应的数据。
+
+界面还支持调用详情、统计概览和中英文标签。检查和导出使用同一组不可变的选择集合，不会悄悄退回全量数据库导出。生成文件固定保存在当前数据目录的 `data/exports/`，可从页面直接下载。
+
+Canonical、ShareGPT、tool SFT 和 OpenAI 格式都支持“限制每条记录上下文”。启用后，每条样本以一个 assistant 消息作为目标，保留固定前缀和最近的完整历史，保持完整的工具调用/结果组，并按预算压缩过长的工具结果或 system 前缀。原有 `openai_windowed` 格式继续保留兼容。长轨迹建议先检查，再根据页面报告的窗口预算选择 `max_seq_len`。
+
+代理默认只监听 `127.0.0.1`。数据浏览访问控制和透明转发是分开的；未配置 `ui_tokens` 时，Web 管理界面和 `/api/*` 数据接口只允许本机回环地址访问。
+
+需要从局域网或其他非回环地址访问时，必须同时配置独立代理令牌和上游白名单：
 
 ```json
 {
+  "bind": "0.0.0.0",
+  "proxy_tokens": ["proxy-secret"],
+  "upstream_allowlist": ["api.openai.com", "*.example.com"],
   "ui_tokens": ["change-me"],
   "upstream_conn_limit": 1000,
   "upstream_conn_limit_per_host": 0,
@@ -358,7 +393,7 @@ LLM_TAP_DATA_DIR=/path/to/llm-tap-data python3 tray_app.py
 }
 ```
 
-然后访问一次 `http://host:12345/?token=change-me` 写入浏览器 cookie。API 客户端也可以发送 `Authorization: Bearer change-me`。
+远程代理请求必须额外发送 `X-LLM-Tap-Token: proxy-secret`；该请求头不会转发给上游，因此原有的 `Authorization` 或 `x-api-key` 仍用于真实服务商认证。然后访问一次 `http://host:12345/?token=change-me` 写入浏览器 cookie。Web API 客户端也可以发送 `Authorization: Bearer change-me`。
 
 ### 调用列表
 

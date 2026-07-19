@@ -32,23 +32,6 @@ ACTIVE_DURATION = 2.0  # seconds the icon stays "active" after a captured call
 _RESAMPLE = getattr(Image, "LANCZOS", None) or Image.Resampling.LANCZOS
 
 
-def _lan_ip() -> str:
-    """Best-effort LAN IP of this machine (for displaying in the tray menu).
-
-    Opens a UDP socket to a public address without sending anything; the OS
-    picks the LAN interface address for the route. Falls back to 127.0.0.1.
-    """
-    import socket
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
 def _load_font(size: int):
     """Load a bold TTF for the count badge, falling back to PIL's default."""
     for p in (
@@ -84,7 +67,6 @@ class TrayApp:
     def __init__(self, port: int = DEFAULT_PORT, data_dir: str = DEFAULT_DATA_DIR):
         self.port = port
         self.data_dir = os.path.abspath(os.path.expanduser(data_dir))
-        self.lan_ip = _lan_ip()
         self.count = 0
         self.active_until = 0.0
         self.lock = threading.Lock()
@@ -98,7 +80,7 @@ class TrayApp:
                 pystray.MenuItem(lambda _: f"Captured: {self.count}", None, enabled=False),
                 pystray.MenuItem(lambda _: f"Port: {self.port}", None, enabled=False),
                 pystray.MenuItem(lambda _: f"Data: {self.data_dir}", None, enabled=False),
-                pystray.MenuItem(lambda _: f"http://{self.lan_ip}:{self.port}/", None, enabled=False),
+                pystray.MenuItem(lambda _: f"http://127.0.0.1:{self.port}/", None, enabled=False),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Browse Data", self._open_web),
                 pystray.MenuItem("Settings...", self._open_settings),

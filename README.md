@@ -6,6 +6,17 @@ LLM transparent proxy + data collection system.
 
 Change the client's LLM request URL from `https://api.xxx.com` to `http://127.0.0.1:12345/api.xxx.com`, and the proxy transparently forwards requests/responses while saving each complete call as-is for downstream training data construction.
 
+## Start Here
+
+| Goal | Where to go |
+|------|-------------|
+| Run the proxy and connect a client | [Quick Start](#quick-start) and [Client Configuration Examples](#client-configuration-examples) |
+| Browse captured calls | [Web UI](#web-ui) |
+| Export training data from selected calls | [Harness Dataset Export](#harness-dataset-export) |
+| Understand formats, filtering, and context limits | [Dataset Export Design](docs/dataset-export.md) |
+
+The normal workflow is: **start the proxy -> point the client at the proxy -> use the client normally -> select calls in the Web UI -> inspect and export**. Raw captures stay in the active data directory; generated datasets are separate export files.
+
 ## How It Works
 
 ```
@@ -60,7 +71,7 @@ The tray app starts the proxy on port `12345` by default. Open the Web UI from t
 **Option B — Run from source**
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-app.txt
 python3 proxy_oneapi.py -p 12345
 ```
 
@@ -129,7 +140,7 @@ Zero proxy config — routing is automatic by host.
 
 ## Data Storage
 
-### File Structure
+### Directory layout
 
 ```
 data/calls/
@@ -146,7 +157,7 @@ data/calls/
 
 Organized by host + date. Each file is one complete call.
 
-### File Structure
+### Single-call file
 
 ```json
 {
@@ -188,6 +199,18 @@ Anthropic's `thinking` block (with `signature`), `tool_use` block, `tool_result`
 `export_harness_dataset.py` converts raw calls into a provider-neutral agent harness trajectory JSONL format. The canonical format preserves messages, tool calls, tool results, reasoning, harness metadata, and raw protocol fragments so it can later be compiled to OpenAI, ShareGPT, ChatML, TRL, LLaMA-Factory, or other training formats.
 
 For the full export design, processing rules, sliding-window strategy, and parameter reference, see [Dataset Export Design](docs/dataset-export.md).
+
+### Choose an output format
+
+| Format | Choose it when |
+|--------|----------------|
+| `canonical` | You want the most complete provider-neutral intermediate data for later conversion or auditing. |
+| `openai` | Your training loader expects one OpenAI-style `{"messages": [...]}` object per JSONL line. |
+| `tool_sft` | Your training framework understands structured tool calls and `role=tool` messages. |
+| `sharegpt` | Your training loader expects a ShareGPT JSON array and text-based tool tags. |
+| `openai_windowed` | Long trajectories need multiple assistant-targeted samples under a sequence budget. |
+
+For a first export, inspect the data, select records in the Web UI, and use `openai` or `tool_sft` unless your training framework requires another format. Use `--context-limit` when each exported sample must fit a per-record budget.
 
 Inspect exportable data:
 
@@ -266,9 +289,10 @@ Global options:
 | `--include-skipped` | off | By default, low-quality examples such as calls without assistant output are skipped; enable this to write them anyway. |
 | `--include-metadata` | off | Adds source, model, harness, labels, and stats in supported formats. Useful for debugging and traceability; usually unnecessary for training. |
 | `--no-tools` | off | Applies only to `sharegpt`. Disables `<tools>...</tools>` tool definition injection while preserving tool call/result text trajectories. |
-| `--max-seq-len N` | `4096` | Applies only to `openai_windowed`. Maximum estimated window length. |
-| `--chars-per-token N` | `4.0` | Applies only to `openai_windowed`. Estimates tokens as `JSON characters / N` when no tokenizer is available; smaller values are more conservative. |
-| `--prefix-budget-ratio N` | `0.45` | Applies only to `openai_windowed`. Maximum fraction of the window budget reserved for the fixed prefix, preventing long system prompts from crowding out history. |
+| `--context-limit` | off | Enable per-record context limits for canonical, sharegpt, tool_sft, or openai. |
+| `--max-seq-len N` | `4096` | Applies to `--context-limit` or `openai_windowed`. Maximum estimated length per record. |
+| `--chars-per-token N` | `4.0` | Applies to context limits. Estimates tokens as `JSON characters / N`; smaller values are more conservative. |
+| `--prefix-budget-ratio N` | `0.45` | Applies to context limits. Maximum fraction reserved for the fixed prefix, preventing long system prompts from crowding out history. |
 
 Format summary:
 
@@ -303,6 +327,7 @@ python3 proxy_oneapi.py -p 12345 --log-level INFO
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-p, --port` | 12345 | Listen port |
+| `--bind` | `127.0.0.1` | Listen address; may also be set as `bind` in `config.json` |
 | `--log-level` | INFO | Log level (DEBUG/INFO/WARNING/ERROR) |
 
 ## Desktop App (Menu Bar / System Tray)
@@ -334,16 +359,26 @@ Prebuilt binaries are published via GitHub Actions on every `v*` tag — see **Q
 
 ## Web UI
 
-Visit `http://127.0.0.1:12345/` in browser for a management interface with:
-- Call list with filtering (host, protocol, model, status)
-- Call detail viewer (full request/response JSON)
-- Statistics overview (by host, protocol, model)
-- Chinese/English language switch
+Visit `http://127.0.0.1:12345/` in a browser for the management interface. The main workflow is:
 
-Data browsing is protected separately from transparent forwarding. Without `ui_tokens`, the Web UI and `/api/*` data endpoints are only available from local loopback (`localhost` / `127.0.0.1` / `::1`). For public deployment, add `ui_tokens` to `config.json`:
+1. Filter calls by Host, Model, protocol, status, or local start/end time.
+2. Select individual calls, the current page, or all calls matching the current filters. Selection persists across pages.
+3. Open **Export**, inspect the selected records, and review the quality and context-budget summary.
+4. Choose a format and export. The downloaded file contains only the selected call IDs.
+
+The UI supports call details, statistics, English/Chinese labels, and the formats listed above. Inspection and export use the same immutable selection; the UI never silently falls back to a full-database export. Generated files are restricted to `data/exports/` under the active data directory and can be downloaded from the page.
+
+Canonical, ShareGPT, tool SFT, and OpenAI exports support **Limit context per record**. When enabled, each sample targets one assistant message, keeps the fixed prefix and nearest complete history, preserves complete tool-call/result groups, and compacts oversized tool results or system prefixes to fit the budget. The legacy `openai_windowed` format remains available for compatibility. For long trajectories, inspect first and use the reported window budget to choose `max_seq_len`.
+
+The proxy listens on `127.0.0.1` by default. Data browsing is protected separately from transparent forwarding; without `ui_tokens`, the Web UI and `/api/*` data endpoints are only available from local loopback.
+
+To accept LAN or other non-loopback connections, both a dedicated proxy token and an upstream allowlist are required:
 
 ```json
 {
+  "bind": "0.0.0.0",
+  "proxy_tokens": ["proxy-secret"],
+  "upstream_allowlist": ["api.openai.com", "*.example.com"],
   "ui_tokens": ["change-me"],
   "upstream_conn_limit": 1000,
   "upstream_conn_limit_per_host": 0,
@@ -358,7 +393,7 @@ Data browsing is protected separately from transparent forwarding. Without `ui_t
 }
 ```
 
-Then open `http://host:12345/?token=change-me` once to set the browser cookie. API clients can also send `Authorization: Bearer change-me`.
+Remote proxy requests must additionally send `X-LLM-Tap-Token: proxy-secret`. This header is never forwarded upstream, leaving `Authorization` or `x-api-key` available for the real provider credential. Then open `http://host:12345/?token=change-me` once to set the browser cookie. Web API clients can also send `Authorization: Bearer change-me`.
 
 ### Call List
 

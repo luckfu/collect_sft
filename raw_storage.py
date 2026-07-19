@@ -121,7 +121,7 @@ def _build_path(call_id: str, started_at: datetime, upstream_provider: str = "un
 SENSITIVE_HEADER_KEYS = {
     "authorization", "x-api-key", "x-goog-api-key",
     "anthropic-api-key", "anthropic-authorization",
-    "proxy-authorization", "cookie", "set-cookie",
+    "proxy-authorization", "x-llm-tap-token", "cookie", "set-cookie",
 }
 
 

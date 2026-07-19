@@ -1,6 +1,17 @@
 # 训练数据导出设计
 
-本文说明 `llm-tap` 如何把代理采集到的手机/客户端 LLM 调用，转换成可用于微调的数据集格式，包括处理原则、各格式差异、长轨迹滑窗方法和脚本参数。
+本文说明 `llm-tap` 如何把代理采集到的客户端 LLM 调用转换成可用于微调的数据集格式，包括处理原则、各格式差异、长轨迹滑窗方法和脚本参数。
+
+## 先做什么
+
+推荐按下面的路径使用：
+
+1. 先用 `inspect` 检查数据质量和消息结构。
+2. 在 Web 界面按 Host、模型、协议、状态或时间范围筛选，并明确选择要导出的调用。
+3. 在“数据导出”页检查这组选择，再选择目标格式和上下文预算。
+4. 只有确认结果后才导出；生成文件只包含这组调用。
+
+如果训练框架没有特殊要求，优先选择 `openai`（普通消息微调）或 `tool_sft`（结构化工具调用）。需要保留原始信息、后续继续转换时选择 `canonical`；需要把长轨迹拆成多个 assistant 目标样本时选择 `openai_windowed`。
 
 ## 数据流
 
@@ -12,7 +23,13 @@
   -> ShareGPT / tool_sft / OpenAI / OpenAI windowed
 ```
 
-第一层是采集阶段保存的原始调用。每次调用一个 JSON 文件，包含：
+| 层级 | 内容 | 用途 |
+|------|------|------|
+| 原始调用 | 每次调用一个 JSON 文件，保留原始请求、响应、headers 和元数据。 | 保真存档、审计、重新解析。 |
+| `canonical` | 统一的消息、reasoning、工具调用/结果和溯源字段。 | 与服务商和训练框架解耦的中间层。 |
+| 训练格式 | `ShareGPT`、`tool_sft`、`OpenAI` 或 `OpenAI windowed`。 | 提供给具体训练框架。 |
+
+原始调用文件包含：
 
 ```json
 {
@@ -23,7 +40,7 @@
 }
 ```
 
-第二层是 `canonical` 中间格式。它不绑定 OpenAI、Anthropic 或任何训练框架，统一表示：
+`canonical` 中间格式不绑定 OpenAI、Anthropic 或任何训练框架，统一表示：
 
 - `message`: system / developer / user / assistant 文本消息
 - `tool_call`: assistant 发起的工具调用
@@ -32,7 +49,28 @@
 - `tools`: 请求里的工具定义
 - `source` / `harness` / `labels` / `stats`: 溯源和统计信息
 
-第三层才是具体训练格式。这样做的好处是：原始协议只需要解析一次，后续可以继续增加新的导出格式。
+这样做的好处是：原始协议只需要解析一次，后续可以继续增加新的导出格式。
+
+## Web 选择式导出
+
+Web 界面不会再默认导出整个数据库。用户必须先在“调用列表”中选择记录，然后进入“数据导出”检查并导出这批记录。
+
+- 支持逐条选择、选择当前页、选择当前筛选条件下的全部记录。
+- 选择集合跨分页保留，筛选变化不会偷偷替换已经选择的记录。
+- 数据检查和最终导出使用同一组显式 `call_ids`，不会在导出时重新计算筛选结果。
+- 如果选中的记录在导出前已被删除，服务会拒绝导出并报告缺失记录。
+- 生成文件名包含 `selectedN`，用于标识输入调用数量。
+
+命令行导出继续支持全量和 `--limit`，便于已有批处理脚本兼容；只有 Web 工作流强制要求显式选择，避免在界面上误导出整个数据库。
+
+### Web 与命令行的区别
+
+| 场景 | 输入范围 | 适合用途 |
+|------|----------|----------|
+| Web 导出 | 显式 `call_ids` 选择集合 | 人工筛选、检查后导出，避免误选全量数据。 |
+| CLI 导出 | 全量或 `--limit` | 批处理、定时任务和已有脚本。 |
+
+Web 生成的文件名包含 `selectedN`，并固定写入活动数据目录下的 `data/exports/`；Web 请求不能指定任意输出路径。
 
 ## 质量过滤
 
@@ -314,9 +352,10 @@ python export_harness_dataset.py inspect --window-budget --preview 5
 | `--include-skipped` | 关闭 | 包含默认会跳过的低质量样本。 |
 | `--include-metadata` | 关闭 | 在支持的格式中写入调试/溯源元数据。正式训练通常不需要。 |
 | `--no-tools` | 关闭 | 仅对 `sharegpt` 生效，不注入 `<tools>...</tools>` 工具定义。 |
-| `--max-seq-len N` | `4096` | 仅对 `openai_windowed` 生效，窗口最大估算长度。 |
-| `--chars-per-token N` | `4.0` | 仅对 `openai_windowed` 生效，无 tokenizer 时的字符/token 估算除数。 |
-| `--prefix-budget-ratio N` | `0.45` | 仅对 `openai_windowed` 生效，固定前缀最多占窗口预算的比例。 |
+| `--context-limit` | 关闭 | 对 canonical、sharegpt、tool_sft 或 openai 启用单条记录上下文约束。 |
+| `--max-seq-len N` | `4096` | 对 `--context-limit` 或 `openai_windowed` 生效，单条记录最大估算长度。 |
+| `--chars-per-token N` | `4.0` | 对上下文约束生效，无 tokenizer 时的字符/token 估算除数。 |
+| `--prefix-budget-ratio N` | `0.45` | 对上下文约束生效，固定前缀最多占窗口预算的比例。 |
 
 ## 常用命令
 
