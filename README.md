@@ -6,6 +6,8 @@
 
 Change the client's LLM request URL from `https://api.xxx.com` to `http://127.0.0.1:12345/api.xxx.com`, and the proxy transparently forwards requests/responses while saving each complete call as-is for downstream training data construction.
 
+![llm-tap Web UI with filtering and explicit record selection](docs/screenshots/overview-en.png)
+
 ## Start Here
 
 | Goal | Where to go |
@@ -394,10 +396,6 @@ To accept LAN or other non-loopback connections, both a dedicated proxy token an
 ```
 
 Remote proxy requests must additionally send `X-LLM-Tap-Token: proxy-secret`. This header is never forwarded upstream, leaving `Authorization` or `x-api-key` available for the real provider credential. Then open `http://host:12345/?token=change-me` once to set the browser cookie. Web API clients can also send `Authorization: Bearer change-me`.
-
-### Filter and select calls
-
-![Call list with database-driven filters, time range, and explicit record selection](docs/screenshots/overview-en.png)
 
 ### Call Detail
 
